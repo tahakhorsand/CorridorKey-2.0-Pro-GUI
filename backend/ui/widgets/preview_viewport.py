@@ -1,0 +1,1310 @@
+"""Center panel — frame preview viewport.
+
+
+
+Phase 3: Composites SplitViewWidget, ViewModeBar, FrameScrubber, and
+
+AsyncDecoder for a professional preview experience.
+
+
+
+Architecture (Codex findings incorporated):
+
+- QImage as internal currency, not QPixmap (guaranteed CPU-only)
+
+- Stem-based navigation via FrameIndex (no index misalignment)
+
+- Async frame decoding with request coalescing
+
+- Worker preview gated: only applied if viewing same clip + COMP mode + latest frame
+
+- Frame list snapshot built once per clip selection (atomic)
+
+"""
+
+from __future__ import annotations
+
+
+
+import os
+
+import logging
+
+
+
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+
+from PySide6.QtCore import Qt, Signal, Slot
+
+from PySide6.QtGui import QImage
+
+
+
+from backend import ClipEntry
+
+from ui.preview.frame_index import FrameIndex, ViewMode, build_frame_index
+
+from ui.preview.display_transform import decode_frame, decode_video_frame, clear_cache, get_cached_qimage, get_cached_video_qimage
+
+from ui.preview.async_decoder import AsyncDecoder
+
+from ui.widgets.split_view import SplitViewWidget
+
+from ui.widgets.frame_scrubber import FrameScrubber
+
+from ui.widgets.view_mode_bar import ViewModeBar
+
+from ui.widgets.annotation_overlay import AnnotationModel
+
+
+
+logger = logging.getLogger(__name__)
+
+
+
+
+
+class PreviewViewport(QWidget):
+
+    """Center panel frame preview with split view, scrubber, and mode switching.
+
+
+
+    When used inside DualViewerPanel, pass show_scrubber=False to hide the
+
+    internal scrubber (the dual viewer provides a shared one).
+
+    """
+
+
+
+    frame_changed = Signal(int)  # current stem index
+
+    view_mode_changed = Signal(str)
+
+
+
+    def __init__(self, show_scrubber: bool = True, parent=None):
+
+        super().__init__(parent)
+
+        self.setMinimumSize(200, 150)
+
+
+
+        # State
+
+        self._clip: ClipEntry | None = None
+
+        self._clip_name: str = ""
+
+        self._frame_index: FrameIndex | None = None
+
+        self._current_stem_idx: int = -1
+
+        self._current_mode: ViewMode = ViewMode.COMP
+
+        self._locked_mode: ViewMode | None = None
+
+        self._input_exr_is_linear: bool = False
+
+
+
+        # Async decoder
+
+        self._decoder = AsyncDecoder(self)
+
+        self._decoder.frame_decoded.connect(self._on_frame_decoded)
+
+
+
+        # Build layout
+
+        layout = QVBoxLayout(self)
+
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        layout.setSpacing(0)
+
+
+
+        # Top bar: view modes (left) + clip info (right)
+
+        self._top_bar = QWidget()
+
+        self._top_bar.setFixedHeight(30)
+
+        self._top_bar.setStyleSheet("background: #0E0D00;")
+
+        top_bar = QHBoxLayout(self._top_bar)
+
+        top_bar.setContentsMargins(0, 0, 0, 0)
+
+        top_bar.setSpacing(0)
+
+
+
+        self._mode_bar = ViewModeBar()
+
+        self._mode_bar.mode_changed.connect(self._on_mode_changed)
+
+        top_bar.addWidget(self._mode_bar)
+
+
+
+        self._clip_info = QLabel("")
+
+        self._clip_info.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self._clip_info.setStyleSheet(
+
+            "color: #808070; font-size: 11px; padding-right: 8px; background: #0E0D00;"
+
+        )
+
+        top_bar.addWidget(self._clip_info)
+
+
+
+        # A/B wipe button — hidden by default, shown via add_ab_button()
+
+        self._ab_button: QPushButton | None = None
+
+
+
+        layout.addWidget(self._top_bar)
+
+
+
+        # Annotation model (shared across frames, persists during scrubbing)
+
+        self._annotation_model = AnnotationModel()
+
+        # Holdout model (chroma key forced regions, frame-independent)
+
+        self._holdout_model = AnnotationModel(filename="holdout_strokes.json")
+
+
+
+        # Split view widget (center, fills space)
+
+        self._split_view = SplitViewWidget()
+
+        self._split_view.zoom_changed.connect(self._on_zoom_changed)
+
+        self._split_view.set_annotation_model(self._annotation_model)
+
+        self._split_view.set_holdout_model(self._holdout_model)
+
+        layout.addWidget(self._split_view, 1)
+
+
+
+        # Bottom bar: scrubber + zoom indicator (optional)
+
+        self._has_scrubber = show_scrubber
+
+        if show_scrubber:
+
+            bottom = QHBoxLayout()
+
+            bottom.setContentsMargins(0, 0, 0, 0)
+
+            bottom.setSpacing(4)
+
+
+
+            self._scrubber = FrameScrubber()
+
+            self._scrubber.frame_changed.connect(self._on_scrubber_frame)
+
+            bottom.addWidget(self._scrubber, 1)
+
+
+
+            self._zoom_label = QLabel("100%")
+
+            self._zoom_label.setFixedWidth(50)
+
+            self._zoom_label.setAlignment(Qt.AlignCenter)
+
+            self._zoom_label.setStyleSheet("color: #808070; font-size: 10px;")
+
+            bottom.addWidget(self._zoom_label)
+
+
+
+            layout.addLayout(bottom)
+
+        else:
+
+            self._scrubber = None
+
+            self._zoom_label = None
+
+
+
+    @property
+
+    def current_stem_index(self) -> int:
+
+        """Current stem index for reprocess targeting."""
+
+        return self._current_stem_idx
+
+
+
+    # ── Public API ──
+
+
+
+    def lock_mode(self, mode: ViewMode) -> None:
+
+        """Lock this viewport to a specific view mode and hide the mode buttons.
+
+
+
+        Used by DualViewerPanel to lock the input viewer to INPUT mode.
+
+        The top bar stays visible (clip info label) so both viewers align.
+
+        """
+
+        self._locked_mode = mode
+
+        self._current_mode = mode
+
+        self._mode_bar.hide()
+
+
+
+    def set_input_exr_is_linear(self, enabled: bool) -> None:
+
+        """Set how INPUT-mode source frames should be interpreted for display."""
+
+        if self._input_exr_is_linear == enabled:
+
+            return
+
+        self._input_exr_is_linear = enabled
+
+
+
+        if self._current_stem_idx < 0:
+
+            return
+
+
+
+        if self._current_mode == ViewMode.INPUT:
+
+            self._request_frame(self._current_stem_idx, self._current_mode)
+
+        if self._split_view.split_enabled:
+
+            self._load_split_images()
+
+
+
+    # ── Eyedropper API ──
+
+
+
+    def set_eyedropper_mode(self, enabled: bool) -> None:
+
+        """Toggle eyedropper color sampling on this viewport."""
+
+        self._split_view.set_eyedropper_mode(enabled)
+
+
+
+    def set_eyedropper_source(self, image: QImage | None) -> None:
+
+        """Set the input frame image for eyedropper sampling."""
+
+        self._split_view.set_eyedropper_source(image)
+
+
+
+    # ── Annotation API ──
+
+
+
+    def set_annotation_mode(self, mode: str | None) -> None:
+
+        """Set annotation mode: 'fg', 'bg', or None to disable."""
+
+        self._split_view.set_annotation_mode(mode)
+
+
+
+    @property
+    def annotation_mode(self) -> str | None:
+        return self._split_view.annotation_mode
+
+    @property
+    def is_annotating(self) -> bool:
+        return self._split_view.is_annotating
+
+
+
+    @property
+
+    def annotation_model(self) -> AnnotationModel:
+
+        return self._annotation_model
+
+
+
+    @property
+
+    def holdout_model(self) -> AnnotationModel:
+
+        return self._holdout_model
+
+
+
+    def set_holdout_active(self, active: bool) -> None:
+
+        self._split_view.set_holdout_active(active)
+
+
+
+    def clear_holdout(self) -> None:
+
+        """Clear all holdout strokes for the current clip."""
+
+        self._holdout_model.clear()
+
+        if self._clip is not None:
+
+            self._holdout_model.save(self._clip.root_path)
+
+        self._split_view.update()
+
+
+
+    def clear_annotations(self) -> None:
+
+        """Clear all annotations for the current clip."""
+
+        self._annotation_model.clear()
+
+        if self._clip is not None:
+
+            self._annotation_model.save(self._clip.root_path)
+
+        self._split_view.update()
+
+
+
+    def set_clip(self, clip: ClipEntry) -> None:
+
+        """Load a clip and build its frame index.
+
+
+
+        Called when user selects a clip in the browser.
+
+        Builds frame index atomically (Codex: snapshot, don't re-read per scrub).
+
+        EXTRACTING clips show a placeholder — no frames to scrub yet.
+
+        """
+
+        from backend import ClipState
+
+
+
+        # Save annotations and holdout for previous clip before switching
+
+        if self._clip is not None:
+
+            self._annotation_model.save(self._clip.root_path)
+
+            self._holdout_model.save(self._clip.root_path)
+
+        self._clip = clip
+
+        self._clip_name = clip.name
+
+        # Preserve the caller-managed input interpretation when reloading a clip.
+
+        # MainWindow reapplies the remembered per-clip override after set_clip();
+
+        # resetting here causes tray clicks and clear actions to snap back to the
+
+        # auto-detected default before the user asked for it.
+
+        clear_cache()
+
+        self._annotation_model.load(clip.root_path)
+
+        self._holdout_model.load(clip.root_path)
+
+
+
+        # EXTRACTING clips: show placeholder, no frame index
+
+        if clip.state == ClipState.EXTRACTING:
+
+            self._frame_index = None
+
+            self._current_stem_idx = -1
+
+            if self._scrubber:
+
+                self._scrubber.set_range(0)
+
+            self._update_clip_info(clip)
+
+            # Clear any cached images from previous clip
+
+            self._split_view._single_image = None
+
+            self._split_view._left_image = None
+
+            self._split_view._right_image = None
+
+            self._split_view.set_placeholder(
+
+                self.tr("Extracting frames...\n%s") % clip.name
+
+            )
+
+            return
+
+
+
+        # Build frame index
+
+        self._frame_index = self._build_frame_index(clip)
+
+
+
+        # Configure mode bar (unless locked)
+
+        if self._locked_mode is None:
+
+            available = self._frame_index.available_modes()
+
+            self._mode_bar.set_available_modes(available)
+
+            self._current_mode = self._mode_bar.current_mode()
+
+        else:
+
+            self._current_mode = self._locked_mode
+
+
+
+        # Configure scrubber (if we have one)
+
+        if self._scrubber:
+
+            self._scrubber.set_range(self._frame_index.frame_count)
+
+
+
+        # Update clip info label
+
+        self._update_clip_info(clip)
+
+
+
+        if self._frame_index.frame_count > 0:
+
+            self._navigate_to(0)
+
+        else:
+
+            from ui.state_labels import state_display_name
+
+            self._split_view.set_placeholder(
+
+                self.tr("Selected: %s\nState: %s") % (clip.name, state_display_name(clip.state))
+
+            )
+
+
+
+    def refresh_available_assets(self) -> None:
+
+        """Refresh mode availability and frame coverage without resetting navigation.
+
+
+
+        Used by live progress updates while a job is writing frames. This keeps the
+
+        current stem stable instead of calling set_clip(), which would jump back to frame 0.
+
+        """
+
+        if self._clip is None:
+
+            return
+
+
+
+        old_stem: str | None = None
+
+        if self._frame_index and 0 <= self._current_stem_idx < self._frame_index.frame_count:
+
+            old_stem = self._frame_index.stems[self._current_stem_idx]
+
+
+
+        self._frame_index = self._build_frame_index(self._clip)
+
+
+
+        if self._locked_mode is None:
+
+            self._mode_bar.set_available_modes(self._frame_index.available_modes())
+
+            self._current_mode = self._mode_bar.current_mode()
+
+        else:
+
+            self._current_mode = self._locked_mode
+
+
+
+        if self._scrubber:
+
+            self._scrubber.set_range(self._frame_index.frame_count)
+
+
+
+        self._update_clip_info(self._clip)
+
+
+
+        if self._frame_index.frame_count <= 0:
+
+            self._current_stem_idx = -1
+
+            self._split_view.set_annotation_stem_index(-1)
+
+            return
+
+
+
+        if old_stem and old_stem in self._frame_index.stems:
+
+            new_idx = self._frame_index.stems.index(old_stem)
+
+        elif self._current_stem_idx >= 0:
+
+            new_idx = min(self._current_stem_idx, self._frame_index.frame_count - 1)
+
+        else:
+
+            new_idx = 0
+
+
+
+        self._current_stem_idx = new_idx
+
+        self._split_view.set_annotation_stem_index(new_idx)
+
+        if self._scrubber:
+
+            self._scrubber.set_frame(new_idx)
+
+        # Re-push per-stem availability because set_available_modes
+
+        # reset it to "all clip-available" and the current stem may
+
+        # actually only have a subset.
+
+        self._push_stem_availability(new_idx)
+
+
+
+    def load_preview_from_file(self, file_path: str, clip_name: str, frame_index: int) -> None:
+
+        """Load a worker preview image.
+
+
+
+        Gated: only applied if viewing the same clip AND at the latest
+
+        frame (Codex: don't override user browsing).  Always rebuilds
+
+        FrameIndex so mode buttons enable as new outputs appear.
+
+        """
+
+        if clip_name != self._clip_name:
+
+            return
+
+
+
+        # Don't interrupt annotation mode with heavy I/O (frame index rebuild + decode)
+
+        if self._split_view.is_annotating:
+
+            return
+
+
+
+        # Rebuild frame index so newly written outputs are discoverable
+
+        if self._clip:
+
+            self._frame_index = self._build_frame_index(self._clip)
+
+            # Enable mode buttons as new output types appear during inference
+
+            self._mode_bar.set_available_modes(self._frame_index.available_modes())
+
+            # Re-evaluate per-stem availability at the viewer's current
+
+            # position so buttons toggle correctly as frames stream in.
+
+            self._push_stem_availability(self._current_stem_idx)
+
+
+
+        # Ensure we are in COMP view mode so newly rendered frames are visible immediately
+
+        if self._current_mode == ViewMode.INPUT or self._current_mode != ViewMode.COMP:
+
+            self._current_mode = ViewMode.COMP
+
+            if self._mode_bar:
+
+                self._mode_bar.set_mode(ViewMode.COMP)
+
+
+
+        if not os.path.isfile(file_path):
+
+            return
+
+
+
+        qimg = decode_frame(file_path, ViewMode.COMP)
+
+        if qimg:
+
+            self._split_view.set_image(qimg)
+
+            target_idx = max(0, frame_index - 1)
+
+            self._current_stem_idx = target_idx
+
+            if self._scrubber and self._frame_index:
+
+                self._scrubber.set_range(self._frame_index.frame_count)
+
+                self._scrubber.set_frame(target_idx)
+
+
+
+    def _build_frame_index(self, clip: ClipEntry) -> FrameIndex:
+
+        """Build a fresh FrameIndex snapshot for the current clip assets."""
+
+        asset_type = clip.input_asset.asset_type if clip.input_asset else "sequence"
+
+        video_path = clip.input_asset.path if (clip.input_asset and asset_type == "video") else None
+
+        seq_dir = clip.input_asset.path if (clip.input_asset and asset_type == "sequence") else None
+
+        # Resolve output_dir via ClipEntry so per-clip and global "Default
+
+        # Output Directory" overrides are honored. Falls back to
+
+        # ``{clip_root}/Output`` when no override is set.
+
+        try:
+
+            output_dir = clip.output_dir
+
+        except Exception:
+
+            output_dir = None
+
+        return build_frame_index(
+
+            clip.root_path, asset_type, video_path=video_path,
+
+            input_sequence_dir=seq_dir, output_dir=output_dir,
+
+        )
+
+
+
+    def show_placeholder(self, text: str = "No clip selected") -> None:
+
+        """Show placeholder text."""
+
+        self._split_view.set_placeholder(text)
+
+        if self._scrubber:
+
+            self._scrubber.set_range(0)
+
+        self._clip_info.setText("")
+
+        self._clip = None
+
+        self._clip_name = ""
+
+        self._frame_index = None
+
+        self._current_stem_idx = -1
+
+
+
+    def hide_clip_info(self) -> None:
+
+        """Hide the clip info label (used on right panel to avoid duplication)."""
+
+        self._clip_info.hide()
+
+
+
+    def show_clip_info(self) -> None:
+
+        """Show the clip info label."""
+
+        self._clip_info.show()
+
+
+
+    def add_ab_button(self) -> QPushButton:
+
+        """Add an A/B wipe toggle button at the right edge of the top bar.
+
+
+
+        Returns the button so the parent can connect its signal.
+
+        """
+
+        btn = QPushButton("A/B")
+
+        btn.setCheckable(True)
+
+        btn.setFixedHeight(24)
+
+        btn.setFixedWidth(50)
+
+        btn.setToolTip(
+
+            self.tr(
+
+                "Toggle A/B wipe comparison (hotkey: A)\n\n"
+
+                "Overlays input (A) and current output (B) in one viewer\n"
+
+                "with a diagonal divider line.\n\n"
+
+                "Drag the center handle to slide the line.\n"
+
+                "Drag above or below the handle to rotate the angle.\n"
+
+                "Scroll wheel to slide the line (Shift+scroll for fine-grain).\n"
+
+                "Middle-click the line to reset to default."
+
+            )
+
+        )
+
+        btn.setStyleSheet(
+
+            "QPushButton { background-color: #1A1900; color: #808070; "
+
+            "font-size: 10px; padding: 2px 6px; border: 1px solid #2A2910; "
+
+            "margin-right: 8px; }"
+
+            "QPushButton:checked { background-color: #FFF203; color: #000000; "
+
+            "font-weight: 700; border: none; margin-right: 8px; }"
+
+            "QPushButton:hover { border-color: #454430; color: #E0E0E0; }"
+
+        )
+
+        self._top_bar.layout().addWidget(btn)
+
+        self._ab_button = btn
+
+        return btn
+
+
+
+    def navigate_to_frame(self, stem_index: int) -> None:
+
+        """Public method for external scrubber to drive navigation."""
+
+        self._navigate_to(stem_index)
+
+
+
+    def _update_clip_info(self, clip: ClipEntry) -> None:
+
+        """Update the clip info label with frame count, dimensions, and state."""
+
+        parts = []
+
+        asset = clip.input_asset
+
+        if asset:
+
+            parts.append(f"{asset.frame_count} frames")
+
+            # Prefer dimensions over the asset_type string — "1920x1080" is
+
+            # far more useful than a fixed "sequence"/"video" label.
+
+            dims = asset.get_dimensions()
+
+            if dims:
+
+                parts.append(f"{dims[0]}x{dims[1]}")
+
+        from ui.state_labels import state_display_name
+
+        parts.append(state_display_name(clip.state))
+
+        self._clip_info.setText("  \u00B7  ".join(parts))  # middle dot separator
+
+
+
+    def set_split_mode(self, enabled: bool) -> None:
+
+        """Toggle split view on/off."""
+
+        self._split_view.set_split_enabled(enabled)
+
+        if enabled and self._frame_index and self._current_stem_idx >= 0:
+
+            self._load_split_images()
+
+
+
+    def reset_zoom(self) -> None:
+
+        """Reset zoom to fit."""
+
+        self._split_view.reset_zoom()
+
+
+
+    def show_reprocess_preview(self, qimage: QImage) -> None:
+
+        """Show a live reprocess result image in the viewport."""
+
+        if self._split_view.split_enabled:
+
+            self._split_view.set_right_image(qimage)
+
+        else:
+
+            self._split_view.set_image(qimage)
+
+
+
+    # ── Navigation ──
+
+
+
+    def _navigate_to(self, stem_index: int) -> None:
+
+        """Navigate to a stem index and load the frame for current mode."""
+
+        if not self._frame_index or stem_index < 0:
+
+            return
+
+        stem_index = min(stem_index, self._frame_index.frame_count - 1)
+
+        self._current_stem_idx = stem_index
+
+        self._split_view.set_annotation_stem_index(stem_index)
+
+        if self._scrubber:
+
+            self._scrubber.set_frame(stem_index)
+
+        self.frame_changed.emit(stem_index)
+
+
+
+        # Disable mode buttons that don't have a frame at this stem so the
+
+        # user can't click into an empty state. The currently selected
+
+        # mode stays enabled — if it has no frame here, _request_frame
+
+        # falls back to showing the input frame.
+
+        self._push_stem_availability(stem_index)
+
+
+
+        self._request_frame(stem_index, self._current_mode)
+
+
+
+        # If split view, also load input frame for left side
+
+        if self._split_view.split_enabled:
+
+            self._load_split_images()
+
+
+
+    def _push_stem_availability(self, stem_index: int) -> None:
+
+        """Tell the mode bar which modes have a frame at ``stem_index``.
+
+
+
+        Safe to call even if ``stem_index`` is out of range — computes an
+
+        empty set in that case. Keeps the mode bar in sync with whatever
+
+        the current frame index believes about availability at this stem.
+
+        """
+
+        if not self._frame_index or stem_index < 0:
+
+            self._mode_bar.set_current_stem_availability(set())
+
+            return
+
+        present = {
+
+            mode for mode in ViewMode
+
+            if self._frame_index.has_frame(mode, stem_index)
+
+        }
+
+        self._mode_bar.set_current_stem_availability(present)
+
+
+
+    def _request_frame(self, stem_index: int, mode: ViewMode) -> None:
+
+        """Request async decode of a frame.
+
+
+
+        If the requested mode has no frame at this stem, silently falls
+
+        back to the input frame for the same stem so the viewport always
+
+        shows something sensible. The mode bar selection is preserved —
+
+        when the user scrubs back into a range where the selected mode
+
+        has data, the correct frame resumes automatically.
+
+        """
+
+        if not self._frame_index:
+
+            return
+
+
+
+        # Fast path: in-memory cache probe (0ms synchronous latency on UI thread)
+
+        if self._frame_index.is_video_mode(mode):
+
+            video_path = self._frame_index.video_modes.get(mode)
+
+            if video_path:
+
+                cached = get_cached_video_qimage(video_path, stem_index, self._input_exr_is_linear if mode == ViewMode.INPUT else False)
+
+                if cached is not None:
+
+                    self._on_frame_decoded(stem_index, mode.value, cached)
+
+                    return
+
+                self._decoder.request_decode(
+
+                    "", mode, stem_index,
+
+                    video_path=video_path,
+
+                    video_frame_index=stem_index,
+
+                    input_exr_is_linear=(self._input_exr_is_linear if mode == ViewMode.INPUT else False),
+
+                )
+
+            return
+
+
+
+        # Image sequence mode
+
+        path = self._frame_index.get_path(mode, stem_index)
+
+        if path:
+
+            cached = get_cached_qimage(path, mode, self._input_exr_is_linear if mode == ViewMode.INPUT else False)
+
+            if cached is not None:
+
+                self._on_frame_decoded(stem_index, mode.value, cached)
+
+                return
+
+            self._decoder.request_decode(
+
+                path,
+
+                mode,
+
+                stem_index,
+
+                input_exr_is_linear=(self._input_exr_is_linear if mode == ViewMode.INPUT else False),
+
+            )
+
+            return
+
+
+
+        # Fallback: requested mode has no frame at this stem. Show the
+
+        # input frame so the viewport isn't empty. Do NOT change
+
+        # self._current_mode — the mode bar keeps the user's selection.
+
+        if mode != ViewMode.INPUT:
+
+            if self._frame_index.is_video_mode(ViewMode.INPUT):
+
+                video_path = self._frame_index.video_modes.get(ViewMode.INPUT)
+
+                if video_path:
+
+                    self._decoder.request_decode(
+
+                        "", ViewMode.INPUT, stem_index,
+
+                        video_path=video_path,
+
+                        video_frame_index=stem_index,
+
+                        input_exr_is_linear=self._input_exr_is_linear,
+
+                    )
+
+                    return
+
+            input_path = self._frame_index.get_path(ViewMode.INPUT, stem_index)
+
+            if input_path:
+
+                self._decoder.request_decode(
+
+                    input_path,
+
+                    ViewMode.INPUT,
+
+                    stem_index,
+
+                    input_exr_is_linear=self._input_exr_is_linear,
+
+                )
+
+                return
+
+
+
+        # Truly nothing to show for this stem (no input either).
+
+        self._split_view.set_placeholder(
+
+            self.tr("No frame available for stem %d") % stem_index
+
+        )
+
+
+
+    def _load_split_images(self) -> None:
+
+        """Load both input and current-mode images for split view."""
+
+        if not self._frame_index or self._current_stem_idx < 0:
+
+            return
+
+
+
+        # Left = Input
+
+        idx = self._current_stem_idx
+
+        if self._frame_index.is_video_mode(ViewMode.INPUT):
+
+            video_path = self._frame_index.video_modes.get(ViewMode.INPUT)
+
+            if video_path:
+
+                qimg = decode_video_frame(
+
+                    video_path,
+
+                    idx,
+
+                    input_exr_is_linear=self._input_exr_is_linear,
+
+                )
+
+                if qimg:
+
+                    self._split_view.set_left_image(qimg)
+
+        else:
+
+            path = self._frame_index.get_path(ViewMode.INPUT, idx)
+
+            if path:
+
+                qimg = decode_frame(
+
+                    path,
+
+                    ViewMode.INPUT,
+
+                    input_exr_is_linear=self._input_exr_is_linear,
+
+                )
+
+                if qimg:
+
+                    self._split_view.set_left_image(qimg)
+
+
+
+    # ── Signal Handlers ──
+
+
+
+    @Slot(str)
+
+    def set_view_mode(self, mode_value: str) -> None:
+
+        """Programmatically switch view mode (from hotkey or external call)."""
+
+        try:
+
+            mode = ViewMode(mode_value)
+
+        except ValueError:
+
+            return
+
+        btn = self._mode_bar._buttons.get(mode)
+
+        if btn and btn.isEnabled():
+
+            btn.setChecked(True)
+
+            self._on_mode_changed(mode_value)
+
+
+
+    def _on_mode_changed(self, mode_value: str) -> None:
+
+        """Handle view mode switch."""
+
+        try:
+
+            self._current_mode = ViewMode(mode_value)
+
+        except ValueError:
+
+            return
+
+        # Ask the mode bar to re-render all buttons. It preserves the
+
+        # per-stem dim state it already knows about, so switching modes
+
+        # doesn't clobber the dim-on-missing-frame visual.
+
+        for m in self._mode_bar._buttons:
+
+            self._mode_bar._refresh_button_style(m)
+
+        self.view_mode_changed.emit(mode_value)
+
+
+
+        if self._current_stem_idx >= 0:
+
+            self._request_frame(self._current_stem_idx, self._current_mode)
+
+
+
+    @Slot(int)
+
+    def _on_scrubber_frame(self, stem_index: int) -> None:
+
+        """Handle scrubber navigation (debounced)."""
+
+        self._navigate_to(stem_index)
+
+
+
+    @Slot(int, str, object)
+
+    def _on_frame_decoded(self, stem_index: int, mode_value: str, qimage: object) -> None:
+
+        """Handle async decode completion — display the image."""
+
+        if qimage is None:
+
+            return
+
+
+
+        if not isinstance(qimage, QImage):
+
+            return
+
+
+
+        if self._split_view.split_enabled:
+
+            # Determine if this is left or right
+
+            if mode_value == ViewMode.INPUT.value:
+
+                self._split_view.set_left_image(qimage)
+
+            else:
+
+                self._split_view.set_right_image(qimage)
+
+        else:
+
+            self._split_view.set_image(qimage)
+
+
+
+    @Slot(float)
+
+    def _on_zoom_changed(self, zoom: float) -> None:
+
+        if self._zoom_label:
+
+            self._zoom_label.setText(f"{int(zoom * 100)}%")
+

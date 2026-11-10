@@ -1,0 +1,54 @@
+# Python pycache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments & Embedded Runtimes
+backend/venv/
+backend/python/
+venv/
+.env
+
+# Large Assets, Binaries & Pretrained Weights
+backend/weights/**
+!backend/weights/**/
+!backend/weights/**/*.gitkeep
+backend/vfms/**
+!backend/vfms/**/
+!backend/vfms/**/*.gitkeep
+backend/ffmpeg/
+weights/**
+vfms/**
+*.tar.zst
+*.tar
+*.zst
+*.zip
+*.pt
+*.npz
+
+# Outputs, User Data & Temporary Files
+out*/
+tmp/
+Projects/
+logs/
+config/
+backend/config/
+*.log
+*.mov
+*.mp4
+*.exr
+*.png
+*.jpg
+*.jpeg
+*.f16
+*.f32
+
+# Rust build target
+rust_core/target/
+backend/rust_core/target/
+target/
+
+# Local / studio-specific files
+path_mappings.json
+.claude/

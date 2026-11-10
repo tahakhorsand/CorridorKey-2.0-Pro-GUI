@@ -1,0 +1,18 @@
+[package]
+name = "ck2_native"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "ck2_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
