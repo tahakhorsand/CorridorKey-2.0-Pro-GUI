@@ -488,7 +488,7 @@ class SettingsMixin:
 
         box = QMessageBox(self)
 
-        box.setWindowTitle(_tr("About EZ-CorridorKey"))
+        box.setWindowTitle(_tr("About CorridorKey 2.0"))
 
         box.setTextFormat(Qt.RichText)
 
@@ -838,9 +838,9 @@ class SettingsMixin:
 
         QMessageBox.information(
 
-            self, _tr("Update EZ-CorridorKey"),
+            self, _tr("Update CorridorKey 2.0"),
 
-            _tr("EZ-CorridorKey is already updated to v%s.\n\n"
+            _tr("CorridorKey 2.0 is already updated to v%s.\n\n"
 
                 "Restart the app to load the new version.") % local,
 
@@ -856,7 +856,7 @@ class SettingsMixin:
 
         reply = QMessageBox.question(
 
-            self, _tr("Update EZ-CorridorKey"),
+            self, _tr("Update CorridorKey 2.0"),
 
             _tr("This will save your session, close the app, and run the updater.\n"
 
@@ -918,7 +918,7 @@ class SettingsMixin:
 
         reply = QMessageBox.question(
 
-            self, _tr("Update EZ-CorridorKey"),
+            self, _tr("Update CorridorKey 2.0"),
 
             _tr("This will download the latest version, replace the current app,\n"
 
@@ -946,7 +946,7 @@ class SettingsMixin:
 
         )
 
-        progress.setWindowTitle(_tr("Updating EZ-CorridorKey"))
+        progress.setWindowTitle(_tr("Updating CorridorKey 2.0"))
 
         progress.setMinimumWidth(400)
 

@@ -237,9 +237,9 @@ def create_app(argv: list[str] | None = None) -> QApplication:
     _prewarm_mlx()
 
     app = QApplication(argv)
-    app.setApplicationName("CorridorKey2")
-    app.setApplicationDisplayName("EZ-CorridorKey 2.0")
-    app.setOrganizationName("CorridorKey2")
+    app.setApplicationName("CorridorKey 2.0")
+    app.setApplicationDisplayName("")
+    app.setOrganizationName("CorridorKey")
 
     # Store all QSettings in a self-contained INI file inside the project's config/ folder
     from PySide6.QtCore import QSettings

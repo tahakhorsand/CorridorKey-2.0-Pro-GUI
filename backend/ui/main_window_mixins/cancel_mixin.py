@@ -130,7 +130,7 @@ class CancelMixin:
                 self,
                 _tr("Force Stop Failed"),
                 _tr("Could not relaunch the app automatically.\n\n"
-                    "Please close and reopen EZ-CorridorKey manually."),
+                    "Please close and reopen CorridorKey 2.0 manually."),
             )
             return
 

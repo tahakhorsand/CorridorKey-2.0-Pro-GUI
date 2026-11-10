@@ -1162,7 +1162,7 @@ class SetupWizard(QDialog):
 
         self._preselected = preselected
 
-        self.setWindowTitle(self.tr("EZ-CorridorKey Setup"))
+        self.setWindowTitle(self.tr("CorridorKey 2.0 Setup"))
 
         self.setMinimumSize(700, 500)
 
