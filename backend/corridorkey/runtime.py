@@ -589,7 +589,6 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                 baton_fp16.flush()
             except Exception:
                 pass
-        del baton_fp16, live_acc, live_w, rvm_map, cradio_map, moge_map, carry_cache, stage2_frame_cache
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -825,8 +824,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         settings_path = os.path.join(output_dir, f"{clip_name}_settings.txt")
         try:
             with open(settings_path, "w") as sf:
-                sf.write(f"CorridorKey v2 Inference Settings Log\n")
-                sf.write(f"====================================\n")
+                sf.write("CorridorKey v2 Inference Settings Log\n")
+                sf.write("====================================\n")
                 sf.write(f"Input: {input_path}\n")
                 sf.write(f"Output Directory: {output_dir}\n")
                 sf.write(f"Resolution: {W_out}x{H_out}\n")

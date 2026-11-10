@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ui.widgets.batch_pipeline_dialog import BatchClipConfig
 
 from PySide6.QtCore import Slot
 from PySide6.QtWidgets import QDialog, QInputDialog, QMessageBox
@@ -68,8 +72,6 @@ class BatchPipelineMixin:
     @Slot()
     def _on_batch_clear_requested(self, dialog) -> None:
         """Handle Clear Pipeline button. Always confirms before clearing."""
-        from PySide6.QtWidgets import QMessageBox
-
         msg = (_tr("Cancel all pending batch jobs and clear the pipeline?")
                if self._batch_configs
                else _tr("Clear the current batch folder and clip list?"))

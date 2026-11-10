@@ -1,8 +1,8 @@
 """Native SAM 3.1 video mask tracker & interactive segmenter for CorridorKey 2.0.
 
 Uses local weights:
-- E:\\CorridorKey 2.0\\weights\\sam3\\sam3.1-INT8-ConvRot.safetensors (with on-the-fly Hadamard ConvRot dequantization)
-- E:\\CorridorKey 2.0\\weights\\sam3\\sam3.1-tracker-head.safetensors (multiplex tracker & interactive prompt decoder)
+- backend/weights/sam3/sam3.1-INT8-ConvRot.safetensors (with on-the-fly Hadamard ConvRot dequantization)
+- backend/weights/sam3/sam3.1-tracker-head.safetensors (multiplex tracker & interactive prompt decoder)
 
 Strictly manages VRAM: moves weights to CUDA only during active segmentation/tracking and
 offloads back to CPU + empties CUDA cache immediately in `finally:` blocks.

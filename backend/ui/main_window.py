@@ -214,7 +214,6 @@ class _UpdateChecker(QThread):
 
     def run(self):
         try:
-            import json
             import sys as _sys
             import urllib.request
             # Read the published GitHub release, the SAME source the updater
@@ -382,9 +381,6 @@ class MainWindow(
         self._setup_shortcuts()
 
         # Workers
-        from ui.widgets.preferences_dialog import (
-            get_setting_int, KEY_PARALLEL_CLIPS, DEFAULT_PARALLEL_CLIPS,
-        )
         self._gpu_worker = GPUJobWorker(
             self._service,
             max_workers=get_setting_int(KEY_PARALLEL_CLIPS, DEFAULT_PARALLEL_CLIPS),

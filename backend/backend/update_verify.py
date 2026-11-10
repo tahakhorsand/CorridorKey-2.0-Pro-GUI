@@ -14,10 +14,6 @@ import json
 import logging
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.hazmat.primitives import serialization
-from cryptography.exceptions import InvalidSignature
-
 logger = logging.getLogger(__name__)
 
 # GitHub repository this build updates from.
@@ -42,6 +38,16 @@ def verify_manifest(manifest_bytes: bytes, signature: bytes) -> dict:
     Raises UpdateVerificationError if the signature is invalid or the
     manifest cannot be parsed.
     """
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        raise UpdateVerificationError(
+            "The 'cryptography' library is required to verify update manifests. "
+            "Please install it with: pip install cryptography"
+        )
+
     try:
         pub_key = serialization.load_pem_public_key(SIGNING_PUBLIC_KEY_PEM)
     except Exception as e:

@@ -1,3 +1,4 @@
+# CorridorKey 2.0 Core Dependencies
 numpy>=1.26,<2
 opencv-python>=4.11
 transformers>=4.57,<5
@@ -9,3 +10,12 @@ scipy>=1.16
 pillow>=11
 tqdm>=4.67
 utils3d @ git+https://github.com/EasternJournalist/utils3d.git@83bfa5bda008803f6521ce9547f94023b8afeddd
+
+# Desktop GUI & Security
+PySide6>=6.5
+cryptography>=41.0
+nvidia-ml-py>=12.5
+
+# Deep Learning (For CUDA GPU acceleration, install with matching CUDA index URL, e.g. --index-url https://download.pytorch.org/whl/cu128)
+torch>=2.2.0
+torchvision>=0.17.0

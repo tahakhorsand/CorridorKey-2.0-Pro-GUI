@@ -1,6 +1,6 @@
 """BiRefNet Processor wrapper for CorridorKey 2.0.
 
-Resolves BiRefNet models from C:\\Users\\imtaha\\.cache\\huggingface (and local
+Resolves BiRefNet models from local Hugging Face cache (and local
 model cache directories) with all 9 ZhengPeng7 BiRefNet variants:
   - Matting (ZhengPeng7/BiRefNet-matting)
   - General (ZhengPeng7/BiRefNet)
@@ -28,8 +28,8 @@ from backend.frame_io import imwrite_unicode
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HF_CACHE_ROOT = Path(r"C:\Users\imtaha\.cache\huggingface")
-DEFAULT_HF_HUB_DIR = DEFAULT_HF_CACHE_ROOT / "hub"
+DEFAULT_HF_CACHE_ROOT = Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
+DEFAULT_HF_HUB_DIR = Path(os.environ.get("HF_HUB_CACHE") or (DEFAULT_HF_CACHE_ROOT / "hub"))
 
 BIREFNET_MODELS: dict[str, tuple[str, int]] = {
     "Matting": ("ZhengPeng7/BiRefNet-matting", 1024),
@@ -77,7 +77,7 @@ def resolve_birefnet_snapshot(repo_id: str, cache_dir: Path = DEFAULT_HF_HUB_DIR
 
 
 class BiRefNetProcessor:
-    """Wrapper for BiRefNet models using C:\\Users\\imtaha\\.cache\\huggingface."""
+    """Wrapper for BiRefNet models using local Hugging Face cache."""
 
     def __init__(
         self,
@@ -136,8 +136,8 @@ class BiRefNetProcessor:
                 logger.warning("Local snapshot load failed for %s: %s", snap_path, e)
 
         if model is None:
-            #Temporarily allow HF hub resolution into C:\Users\imtaha\.cache\huggingface\hub if online,
-            #or fall back to the cached ZhengPeng7/BiRefNet snapshot if offline.
+            # Temporarily allow HF hub resolution into local HF cache if online,
+            # or fall back to the cached ZhengPeng7/BiRefNet snapshot if offline.
             prev_hf_offline = os.environ.pop("HF_HUB_OFFLINE", None)
             prev_tf_offline = os.environ.pop("TRANSFORMERS_OFFLINE", None)
             try:

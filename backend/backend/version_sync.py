@@ -170,7 +170,7 @@ def sync_uninstall_version() -> None:
         return
 
     try:
-        import winreg  # noqa: F401 - availability check on Windows
+        import winreg
     except ImportError:
         return
 
@@ -179,8 +179,6 @@ def sync_uninstall_version() -> None:
         return
 
     try:
-        import winreg
-
         # Try HKCU first because lowest-privilege installs land there.
         # Also try HKLM because users who elevated during install land there.
         # Silent failure on either is fine; at least one should match.

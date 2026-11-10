@@ -44,6 +44,19 @@ backend/config/
 *.f16
 *.f32
 
+# Whitelist UI assets, icons, themes, fonts, sounds
+!backend/ui/theme/**
+!backend/ui/theme/**/*.png
+!backend/ui/theme/**/*.jpg
+!backend/ui/theme/**/*.jpeg
+!backend/ui/theme/**/*.ico
+!backend/ui/theme/**/*.icns
+!backend/ui/theme/**/*.svg
+!backend/ui/theme/fonts/**
+!backend/ui/sounds/**
+backend/ui/**/__pycache__/
+backend/ui/**/*.pyc
+
 # Rust build target
 rust_core/target/
 backend/rust_core/target/
