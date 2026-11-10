@@ -16,29 +16,22 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
-PRODUCT = "ez-corridorkey"
+PRODUCT = "corridorkey-2.0"
 
-_DSN = "".join([
-    "https://", "c6c8d171-fdd6-4649-8eb4-2ea4de28943e",
-    "@", "ingest.", "ezscape.space", "/9",
-])
+_DSN = ""
 
-_ORIGIN = "/".join(["edenaion", "EZ-CorridorKey"])
+_ORIGIN = "tahakhorsand/CorridorKey-2.0-Pro-GUI"
 
 
 def _origin_ok() -> bool:
-    try:
-        from backend.update_verify import UPDATE_ORIGIN
-        return UPDATE_ORIGIN == _ORIGIN
-    except Exception:
-        return False
+    return True
 
 # Stage values: installer, updater, runtime, inference.
 # Extraction/import failures map to runtime; GPU job failures to inference.
 VALID_STAGES = frozenset({"installer", "updater", "runtime", "inference"})
 
-SETTINGS_ORG = "EZSCAPE"
-SETTINGS_APP = "EZ-CorridorKey"
+SETTINGS_ORG = "CorridorKey"
+SETTINGS_APP = "CorridorKey2"
 KEY_CRASH_REPORTS = "privacy/crash_reports_enabled"
 
 _install_id_cache: str | None = None

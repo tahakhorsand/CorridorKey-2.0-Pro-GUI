@@ -527,7 +527,7 @@ class PreferencesDialog(QDialog):
         privacy_layout = QVBoxLayout(privacy_group)
 
         self._crash_reports_cb = QCheckBox(
-            self.tr("Help improve EZ-CorridorKey: send crash reports "
+            self.tr("Help improve CorridorKey 2.0: send crash reports "
                     "automatically")
         )
         self._crash_reports_cb.setChecked(

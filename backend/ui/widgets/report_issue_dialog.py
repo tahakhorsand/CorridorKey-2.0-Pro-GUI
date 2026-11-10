@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 logger = logging.getLogger(__name__)
 
-_GITHUB_ISSUES_URL = "https://github.com/edenaion/EZ-CorridorKey/issues/new"
+_GITHUB_ISSUES_URL = "https://github.com/tahakhorsand/CorridorKey-2.0-Pro-GUI/issues/new"
 _MAX_URL_LENGTH = 7500  # stay well under 8192 to avoid 414 errors
 
 
