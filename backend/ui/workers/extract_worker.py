@@ -240,7 +240,8 @@ class ExtractWorker(QThread):
     # Map: hint name -> output directory name
     _HINT_MAP = {
         "AlphaHint": "AlphaHint",
-        "VideoMamaMaskHint": "VideoMamaMaskHint",
+        "SamMaskHint": "SamMaskHint",
+        "MaskHint": "SamMaskHint",
     }
 
     @classmethod

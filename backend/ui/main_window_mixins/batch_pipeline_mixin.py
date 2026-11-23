@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from ui.widgets.batch_pipeline_dialog import BatchClipConfig
 
 from PySide6.QtCore import Slot
-from PySide6.QtWidgets import QDialog, QInputDialog, QMessageBox
+from PySide6.QtWidgets import QDialog, QInputDialog, QLabel, QMessageBox
 
 from . import _tr
 
@@ -83,10 +83,17 @@ class BatchPipelineMixin:
             return
 
         if self._batch_configs:
-            for clip_name in list(self._batch_configs.keys()):
+            target_clips = set(self._batch_configs.keys())
+            for clip_name in list(target_clips):
                 self._batch_pending_extractions.pop(clip_name, None)
                 self._pipeline_steps.pop(clip_name, None)
+                if hasattr(self, "_extract_worker") and self._extract_worker is not None:
+                    self._extract_worker.cancel(clip_name)
+            # Cancel any queued or running GPU jobs belonging to batch clips
+            self._service.job_queue.cancel_clips(target_clips)
             self._batch_configs.clear()
+            if hasattr(self, "_queue_panel"):
+                self._queue_panel.refresh()
             logger.info("Batch pipeline cleared")
 
         dialog.reset_to_initial()
@@ -327,7 +334,7 @@ class BatchPipelineMixin:
             if c.name == clip_name:
                 clip = c
                 break
-        if clip is None or clip.state not in (ClipState.RAW, ClipState.READY):
+        if clip is None or clip.state not in (ClipState.RAW, ClipState.MASKED, ClipState.READY):
             logger.warning(f"Batch: clip {clip_name} not ready after extraction")
             if self._batch_dialog:
                 self._batch_dialog.set_clip_error(clip_name, "Not ready after extraction")
@@ -385,9 +392,8 @@ class BatchPipelineMixin:
                 return  # still extracting
             # Check status widget text
             widget = self._batch_dialog._table.cellWidget(row, 3)
-            if widget and isinstance(widget, type(self._batch_dialog._table.cellWidget(row, 3))):
-                text = widget.text() if hasattr(widget, 'text') else ""
-                if not text:
+            if isinstance(widget, QLabel):
+                if not widget.text():
                     return  # not started yet
 
         self._batch_dialog.set_batch_complete()

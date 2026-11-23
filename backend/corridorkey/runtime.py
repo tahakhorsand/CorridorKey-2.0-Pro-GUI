@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import os
 import sys
 import tempfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +22,8 @@ from .video_io import (
     ThreadedVideoWriter,
     WriterConfig,
     apply_linear_adjust,
+    ceil_to_multiple,
+    center_pad_to_shape,
     frame_paths,
     has_linear_adjust,
     iter_frame_dir_chunks,
@@ -31,7 +35,9 @@ from .video_io import (
     probe_frame_dir_meta,
     probe_video_meta,
     raw_clip_name,
+    resize_hwc_lanczos,
     safe_remove,
+    scaled_hw,
     taper_weights,
     window_starts,
     SequentialFrameDirWindowReader,
@@ -105,6 +111,7 @@ class InferenceConfig:
     carry_hint_quality: float = 0.95
     shape_quantum: int = 128
     model_scale: float = 1.0
+    start_frame: int = 0
     num_frames: int = -1
     start_mode: str = "begin"
     seed: int = 0
@@ -126,8 +133,30 @@ class InferenceConfig:
     frame_dir_linear: bool = False
     cutout_linear: bool = False
     despill_strength: float = 0.5
+    screen_color: str = "green"
     output_format: str = "video"
     exr_dtype: str = "half"
+
+
+def _amp_dtype() -> torch.dtype:
+    if torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _autocast_ctx(device):
+    dev_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    if dev_type == "cuda":
+        return torch.autocast("cuda", dtype=_amp_dtype())
+    return contextlib.nullcontext()
+
+
+def _raise_cancelled(source: str, frame_idx: int = 0) -> None:
+    try:
+        from backend.errors import JobCancelledError
+        raise JobCancelledError(source, frame_idx)
+    except ImportError:
+        raise RuntimeError("Cancelled by user")
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -189,6 +218,9 @@ def select_vram_profile(shape_hw, num_frames: int, budget_gb: float):
 
 
 def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int) -> None:
+    if not torch.cuda.is_available():
+        cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = 8, 4, True
+        return
     free_bytes, _ = torch.cuda.mem_get_info()
     # Memory this process already holds (the loaded model) is part of the budget.
     budget_gb = (free_bytes + torch.cuda.memory_reserved()) / 2**30
@@ -267,18 +299,25 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
 
 
 def configure_low_vram_inference(model, cfg: InferenceConfig):
-    model.stage1.low_vram_enc_frame_chunk = max(0, int(cfg.low_vram_enc_frame_chunk))
+    if cfg.low_vram:
+        enc_chunk = max(0, int(cfg.low_vram_enc_frame_chunk))
+        mlp_chunk = max(0, int(cfg.low_vram_mlp_chunk_tokens))
+        swin_batch = max(0, int(cfg.low_vram_swin_window_batch))
+        attn_chunk = max(0, int(cfg.low_vram_full_attn_query_chunk_tokens))
+    else:
+        enc_chunk = mlp_chunk = swin_batch = attn_chunk = 0
+
+    model.stage1.low_vram_enc_frame_chunk = enc_chunk
     for module in model.modules():
         name = module.__class__.__name__
         if name in ("SwiGLU", "FusionLinSwiglu"):
-            module.inference_chunk_tokens = max(0, int(cfg.low_vram_mlp_chunk_tokens))
+            module.inference_chunk_tokens = mlp_chunk
         if name == "SwinAttention3D":
-            module.inference_window_batch = max(0, int(cfg.low_vram_swin_window_batch))
+            module.inference_window_batch = swin_batch
         if name == "CSwinAttention3D":
-            module.inference_strip_batch = max(0, int(cfg.low_vram_swin_window_batch))
+            module.inference_strip_batch = swin_batch
         if name in ("FullSpatialAttention2D", "FullAttention3D"):
-            module.inference_query_chunk_tokens = max(
-                0, int(cfg.low_vram_full_attn_query_chunk_tokens))
+            module.inference_query_chunk_tokens = attn_chunk
 
 
 def _build_foundation_inputs(rgb_bt: torch.Tensor):
@@ -302,7 +341,7 @@ def _next_or_none(iterator):
 
 @torch.no_grad()
 def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
-                             *, chunk: int, reader_kind: str):
+                             *, chunk: int, reader_kind: str, is_cancelled=None):
     assert model.foundations.rvm is not None
     device = next(model.foundations.rvm.parameters()).device
     T_all = int(meta["num_frames"])
@@ -324,6 +363,8 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_next_or_none, chunks)
         while True:
+            if is_cancelled is not None and is_cancelled():
+                _raise_cancelled(str(source))
             item = future.result()
             if item is None:
                 break
@@ -335,19 +376,20 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
                 rgb.reshape(Tc, 3, H, W), size=(H_e, W_e),
                 mode="bilinear", align_corners=False,
             ).reshape(1, Tc, 3, H_e, W_e).clamp(0.0, 1.0)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with _autocast_ctx(device):
                 feats, state = model.foundations.rvm(rgb_rvm, state=state)
             feats_cpu = (feats.float().cpu() - mean) / std
             out[t0:t0 + Tc] = feats_cpu[0].numpy().astype(np.float16)
             del rgb, rgb_rvm, feats, feats_cpu, display
     out.flush()
     del out
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 @torch.no_grad()
 def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
-                                     *, chunk: int, reader_kind: str):
+                                     *, chunk: int, reader_kind: str, is_cancelled=None):
     device = next(model.foundations.parameters()).device
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
@@ -376,6 +418,8 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_next_or_none, chunks)
         while True:
+            if is_cancelled is not None and is_cancelled():
+                _raise_cancelled(str(source))
             item = future.result()
             if item is None:
                 break
@@ -384,13 +428,13 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
             Tc = display.shape[0]
             rgb = display.unsqueeze(0).to(device, non_blocking=True)
             rgb_radio, rgb_moge = _build_foundation_inputs(rgb)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with _autocast_ctx(device):
                 ff = model.foundations(
                     rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                     rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
                 )
             moge_out[t0:t0 + Tc] = ff["moge"].float().cpu().numpy()
-            if cradio_out is not None:
+            if cradio_out is not None and "cradio" in ff:
                 cradio_out[t0:t0 + Tc] = ff["cradio"].float().cpu().numpy()
             del rgb, rgb_radio, rgb_moge, ff, display
     moge_out.flush()
@@ -398,27 +442,41 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
     if cradio_out is not None:
         cradio_out.flush()
         del cradio_out
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return paths
 
 
+def _target_device_str() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def _phase1_setup(model, *, stage1_on_gpu: bool = True):
-    model.foundations.cuda()
+    dev = _target_device_str()
+    model.foundations.to(dev)
     # Low-VRAM mode precomputes foundation features first, so stage 1 waits on CPU.
     if stage1_on_gpu:
-        model.stage1.cuda()
+        model.stage1.to(dev)
     else:
         model.stage1.cpu()
     model.stage2.cpu()
-    torch.cuda.empty_cache()
+    if dev == "cuda":
+        torch.cuda.empty_cache()
 
 
 def _phase2_setup(model):
+    dev = _target_device_str()
     model.foundations.cpu()
     model.stage1.cpu()
-    torch.cuda.empty_cache()
-    model.stage2.cuda()
-    torch.cuda.synchronize()
+    if dev == "cuda":
+        torch.cuda.empty_cache()
+    model.stage2.to(dev)
+    if dev == "cuda":
+        torch.cuda.synchronize()
 
 
 @torch.no_grad()
@@ -484,7 +542,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
     try:
         for i, t0 in enumerate(starts):
             if is_cancelled is not None and is_cancelled():
-                raise RuntimeError('Cancelled by user')
+                _raise_cancelled(str(source), t0)
             if on_stage1_window is not None:
                 on_stage1_window(i + 1, len(starts))
             t1 = min(t0 + chunk, T_all)
@@ -521,23 +579,30 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             if foundation_paths is None:
                 rgb_found = display_chunk.unsqueeze(0).to(device, non_blocking=True)
                 rgb_radio, rgb_moge = _build_foundation_inputs(rgb_found)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with _autocast_ctx(device):
                     ff = model.foundations(
                         rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                         rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
                     )
-                cradio_feat = ff["cradio"].reshape(1, Tc, -1, H // 64, W // 64)
+                cradio_feat = (
+                    ff["cradio"].reshape(1, Tc, -1, H // 64, W // 64)
+                    if "cradio" in ff and getattr(model.stage1, "cradio_dim", 0) > 0
+                    else None
+                )
                 moge_feat = ff["moge"].reshape(1, Tc, -1, H // 64, W // 64)
             else:
                 moge_feat = torch.from_numpy(np.asarray(moge_map[t0:t1]).copy())
                 moge_feat = moge_feat.unsqueeze(0).to(device, non_blocking=True).float()
-                cradio_feat = torch.from_numpy(np.asarray(cradio_map[t0:t1]).copy())
-                cradio_feat = cradio_feat.unsqueeze(0).to(device, non_blocking=True).float()
+                if cradio_map is not None:
+                    cradio_feat = torch.from_numpy(np.asarray(cradio_map[t0:t1]).copy())
+                    cradio_feat = cradio_feat.unsqueeze(0).to(device, non_blocking=True).float()
+                else:
+                    cradio_feat = None
             rvm_feat = None
             if rvm_map is not None:
                 rvm_feat = torch.from_numpy(np.asarray(rvm_map[t0:t1]).copy())
                 rvm_feat = rvm_feat.unsqueeze(0).to(device, non_blocking=True).float()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with _autocast_ctx(device):
                 s1 = model.stage1(
                     rgb_c, hint_c, moge_feat, cradio_feat=cradio_feat,
                     rvm_feat=rvm_feat, t_stride=1.0,
@@ -574,7 +639,8 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             del model_chunk, display_chunk, review_chunk
             flush_before(next_start)
             print(f"      window {i + 1}/{len(starts)} [{t0}:{t1}]", flush=True)
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         flush_before(T_all + 1)
     finally:
         reader.close()
@@ -601,11 +667,10 @@ def _crop_native_torch(x: torch.Tensor, meta: dict) -> torch.Tensor:
 
 
 def _resize_output_torch(x: torch.Tensor, meta: dict) -> torch.Tensor:
-    if tuple(meta["model_native_hw"]) == tuple(meta["output_hw"]):
+    out_hw = tuple(meta["output_hw"])
+    if tuple(meta["model_native_hw"]) == out_hw and tuple(x.shape[-2:]) == out_hw:
         return x
-    raise RuntimeError(
-        "optimized runtime render path requires native model_scale=1.0; "
-        "non-native scaling would need explicit Lanczos output rendering")
+    return F.interpolate(x, size=out_hw, mode="bilinear", align_corners=False)
 
 
 def _linear_adjust_inverse_torch(linear: torch.Tensor, meta: dict) -> torch.Tensor:
@@ -617,14 +682,22 @@ def _linear_adjust_inverse_torch(linear: torch.Tensor, meta: dict) -> torch.Tens
     return (linear / gain - pivot) / contrast + pivot
 
 
-def _despill_average_srgb_torch(fg: torch.Tensor, strength: float = 0.5) -> torch.Tensor:
+def _despill_average_srgb_torch(
+    fg: torch.Tensor,
+    strength: float = 0.5,
+    screen_color: str = "green",
+) -> torch.Tensor:
     if strength <= 0.0:
         return fg
     r = fg[:, 0:1]
     g = fg[:, 1:2]
     b = fg[:, 2:3]
-    spill = (g - (r + b) * 0.5).clamp(min=0.0)
-    full = torch.cat([r + spill * 0.5, g - spill, b + spill * 0.5], dim=1)
+    if str(screen_color).lower() == "blue":
+        spill = (b - (r + g) * 0.5).clamp(min=0.0)
+        full = torch.cat([r + spill * 0.5, g + spill * 0.5, b - spill], dim=1)
+    else:
+        spill = (g - (r + b) * 0.5).clamp(min=0.0)
+        full = torch.cat([r + spill * 0.5, g - spill, b + spill * 0.5], dim=1)
     if strength >= 1.0:
         return full
     return fg * (1.0 - strength) + full * strength
@@ -668,6 +741,7 @@ def _render_predictions_exr_torch(meta: dict, outputs: set[str],
     alpha_model = logits[:, 0:1].float()
     pa_model = _crop_native_torch(alpha_model, meta).clamp(0.0, 1.0)
     despill_strength = float(meta.get("despill_strength", 0.5))
+    screen_color = str(meta.get("screen_color", "green"))
 
     pa = _resize_output_torch(pa_model, meta).clamp(0.0, 1.0)
     rendered: dict[str, np.ndarray] = {}
@@ -686,14 +760,14 @@ def _render_predictions_exr_torch(meta: dict, outputs: set[str],
         rendered["fg"] = _chw_to_bgr_f32_cpu(pf_linear)
     if "cutout" in outputs:
         pf_linear_despilled = _despill_average_srgb_torch(
-            pf_linear, strength=despill_strength)
+            pf_linear, strength=despill_strength, screen_color=screen_color)
         rendered["cutout"] = _chw_to_bgra_f32_cpu(pf_linear_despilled, pa)
     if "checker" in outputs:
         checker_b = checker.to(device=pf_linear.device,
                                dtype=pf_linear.dtype).unsqueeze(0)
         bg_lin = cu.srgb_to_linear(checker_b)
         pf_despill = _despill_average_srgb_torch(
-            pf_linear, strength=despill_strength)
+            pf_linear, strength=despill_strength, screen_color=screen_color)
         comp_lin = pf_despill * pa + bg_lin * (1.0 - pa)
         rendered["checker"] = _chw_to_bgr_f32_cpu(comp_lin)
     return rendered
@@ -710,6 +784,7 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
     alpha_model = logits[:, 0:1].float()
     pa_model = _crop_native_torch(alpha_model, meta).clamp(0.0, 1.0)
     despill_strength = float(meta.get("despill_strength", 0.5))
+    screen_color = str(meta.get("screen_color", "green"))
 
     pa = _resize_output_torch(pa_model, meta).clamp(0.0, 1.0)
     rendered: dict[str, np.ndarray] = {}
@@ -726,18 +801,21 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
     if "fg" in outputs:
         rendered["fg"] = _srgb_to_bgr_uint16_cpu(pf)
     if "cutout" in outputs:
-        pf_linear_despilled = _despill_average_srgb_torch(pf_linear_pos, strength=despill_strength)
+        pf_linear_despilled = _despill_average_srgb_torch(
+            pf_linear_pos, strength=despill_strength, screen_color=screen_color)
         if meta.get("cutout_linear", False):
             pf_linear_despilled_resized = _resize_output_torch(pf_linear_despilled, meta).clamp(0.0, 1.0)
             rendered["cutout"] = _srgb_to_bgra_uint16_cpu(pf_linear_despilled_resized, pa)
         else:
-            pf_despill = _despill_average_srgb_torch(pf, strength=despill_strength)
+            pf_despill = _despill_average_srgb_torch(
+                pf, strength=despill_strength, screen_color=screen_color)
             rendered["cutout"] = _srgb_to_bgra_uint16_cpu(pf_despill, pa)
     if "checker" in outputs:
         checker_b = checker.to(device=pf.device, dtype=pf.dtype).unsqueeze(0)
         bg_lin = cu.srgb_to_linear(checker_b)
         alpha = pa
-        pf_despill = _despill_average_srgb_torch(pf, strength=despill_strength)
+        pf_despill = _despill_average_srgb_torch(
+            pf, strength=despill_strength, screen_color=screen_color)
         comp_despill_lin = (
             cu.srgb_to_linear(pf_despill) * alpha + bg_lin * (1.0 - alpha))
         comp_despill = cu.linear_to_srgb(
@@ -765,7 +843,10 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         meta = probe_frame_dir_meta(
             input_path, num_frames=cfg.num_frames,
             shape_quantum=cfg.shape_quantum, fps=cfg.frame_dir_fps,
-            exr_linear=cfg.frame_dir_linear, model_scale=cfg.model_scale)
+            exr_linear=cfg.frame_dir_linear, model_scale=cfg.model_scale,
+            linear_brightness=cfg.linear_brightness,
+            linear_contrast=cfg.linear_contrast,
+            linear_contrast_pivot=cfg.linear_contrast_pivot)
         if (not cfg.frame_dir_linear
                 and meta["frame_paths"]
                 and meta["frame_paths"][0].lower().endswith(".exr")):
@@ -780,7 +861,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             model_scale=cfg.model_scale,
             linear_brightness=cfg.linear_brightness,
             linear_contrast=cfg.linear_contrast,
-            linear_contrast_pivot=cfg.linear_contrast_pivot)
+            linear_contrast_pivot=cfg.linear_contrast_pivot,
+            start_frame=cfg.start_frame)
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
@@ -788,8 +870,13 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     H_out, W_out = meta["output_hw"]
     meta["cutout_linear"] = cfg.cutout_linear
     meta["despill_strength"] = cfg.despill_strength
+    meta["screen_color"] = cfg.screen_color
     fps = float(meta["native_fps"])
     clip_name = raw_clip_name(input_path)
+    run_id = uuid.uuid4().hex[:8]
+    rvm_path = cfg.temp_dir / f"{clip_name}_{run_id}_rvm_feat.f16"
+    baton_path = cfg.temp_dir / f"{clip_name}_{run_id}_baton.f16"
+    foundation_prefix = cfg.temp_dir / f"{clip_name}_{run_id}_foundation"
     checker = make_checker(H_out, W_out)
     checker_t = torch.from_numpy(checker)
     writers = {}
@@ -813,7 +900,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                     fps, (W_out, H_out), channels=channels,
                     dtype=cfg.exr_dtype, frame_name=suffix[name])
             else:
-                ext = ".mov" if name == "cutout" else ".mp4"
+                ext = ".mov" if (name == "cutout" or writer_cfg.codec == "prores_ks") else ".mp4"
                 channels = 4 if name == "cutout" else 3
                 color_trc = "linear" if (name == "cutout" and cfg.cutout_linear) else "iec61966-2-1"
                 writers[name] = ThreadedVideoWriter(
@@ -861,11 +948,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             if none_path(initial_hint_path) is not None else None
         )
         _phase1_setup(model, stage1_on_gpu=not cfg.low_vram)
-        if cfg.low_vram:
-            configure_low_vram_inference(model, cfg)
-        rvm_path = cfg.temp_dir / f"{clip_name}_rvm_feat.f16"
-        baton_path = cfg.temp_dir / f"{clip_name}_baton.f16"
-        foundation_prefix = cfg.temp_dir / f"{clip_name}_foundation"
+        configure_low_vram_inference(model, cfg)
         for p in (
             rvm_path, baton_path, Path(str(foundation_prefix) + "_cradio.f32"),
             Path(str(foundation_prefix) + "_moge.f32"),
@@ -875,7 +958,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             precompute_rvm_to_memmap(
                 model, input_path, meta, rvm_path,
                 chunk=max(1, min(int(cfg.hann_chunk), 8)),
-                reader_kind=reader_kind)
+                reader_kind=reader_kind,
+                is_cancelled=is_cancelled)
             rvm_feat_path = rvm_path
         else:
             rvm_feat_path = None
@@ -884,28 +968,33 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             foundation_paths = precompute_foundations_to_memmap(
                 model, input_path, meta, foundation_prefix,
                 chunk=max(1, int(cfg.low_vram_foundation_chunk)),
-                reader_kind=reader_kind)
+                reader_kind=reader_kind,
+                is_cancelled=is_cancelled)
             model.foundations.cpu()
             model.stage2.cpu()
-            model.stage1.cuda()
-            torch.cuda.empty_cache()
+            model.stage1.to(_target_device_str())
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         else:
-            model.stage2.cuda()
+            model.stage2.to(_target_device_str())
             model.stage2.eval()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         stage2_batch = max(1, int(cfg.stage2_batch))
 
         def write_prediction_batches(items):
             device = next(model.stage2.parameters()).device
             for offset in range(0, len(items), stage2_batch):
+                if is_cancelled is not None and is_cancelled():
+                    _raise_cancelled(str(input_path), offset)
                 sub = items[offset:offset + stage2_batch]
                 rgb_t = torch.stack([item[2] for item in sub], dim=0)
                 rgb_t = rgb_t.unsqueeze(0).to(device, non_blocking=True)
                 baton_np = np.stack([item[1] for item in sub], axis=0)
                 baton_t = torch.from_numpy(baton_np).unsqueeze(0)
                 baton_t = baton_t.to(device, non_blocking=True).float()
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.inference_mode(), _autocast_ctx(device):
                     logits = model.stage2(rgb_t, baton_t)
                     if isinstance(logits, tuple):
                         logits = logits[0]
@@ -965,10 +1054,10 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     finally:
         for writer in writers.values():
             writer.release()
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_rvm_feat.f16")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_baton.f16")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
+        safe_remove(rvm_path)
+        safe_remove(baton_path)
+        safe_remove(Path(str(foundation_prefix) + "_cradio.f32"))
+        safe_remove(Path(str(foundation_prefix) + "_moge.f32"))
         try:
             if hasattr(model, "foundations"):
                 model.foundations.cpu()
@@ -988,3 +1077,249 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 pass
     print(f"  wrote {len(writers)} output video(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")
+
+
+@torch.no_grad()
+def infer_single_frame(
+    model,
+    frame_rgb: np.ndarray,
+    *,
+    is_linear: bool = False,
+    hint_mask: np.ndarray | None = None,
+    hint_quality: float = 0.95,
+    model_scale: float = 1.0,
+    linear_brightness: float = 1.0,
+    linear_contrast: float = 1.0,
+    linear_contrast_pivot: float = 0.18,
+    low_vram: bool = False,
+    shape_quantum: int = 128,
+    auto_roi_crop: bool = False,
+    auto_roi_pad_px: int = 96,
+) -> dict[str, np.ndarray]:
+    """Run in-memory single-frame CorridorKey 2.0 inference without writing to disk.
+
+    Args:
+        model: Loaded `CorridorKeyV3` instance (on CPU or GPU).
+        frame_rgb: Input RGB frame `[H, W, 3]` (`uint8` or `float32`).
+        is_linear: Whether `frame_rgb` is already scene-linear HDR float.
+        hint_mask: Optional `[H, W]` soft/binary mask guide (`uint8` or `[0, 1]` float).
+        hint_quality: Confidence weight applied to `hint_mask`.
+        model_scale: Internal processing scale multiplier.
+        linear_brightness: Linear exposure gain before model encoding.
+        linear_contrast: Linear contrast multiplier around `linear_contrast_pivot`.
+        linear_contrast_pivot: Contrast pivot in linear light.
+        low_vram: Enable attention/MLP chunking during forward pass.
+        shape_quantum: Pad model grid multiples (128 recommended, must be % 64 == 0).
+
+    Returns:
+        Dict containing float32 CPU arrays at native `(H, W)` resolution:
+        `alpha_raw` `(H, W)`, `fg_raw` `(H, W, 3)` sRGB, and `fg_linear` `(H, W, 3)`.
+    """
+    import cv2
+
+    if frame_rgb.ndim != 3 or frame_rgb.shape[2] < 3:
+        raise ValueError(f"Expected [H, W, 3+] RGB frame, got shape {frame_rgb.shape}")
+
+    rgb_in = frame_rgb[..., :3]
+    if rgb_in.dtype == np.uint8:
+        rgb_f = rgb_in.astype(np.float32) * (1.0 / 255.0)
+    elif rgb_in.dtype == np.uint16:
+        rgb_f = rgb_in.astype(np.float32) * (1.0 / 65535.0)
+    else:
+        rgb_f = rgb_in.astype(np.float32, copy=False)
+
+    H_orig, W_orig = rgb_f.shape[:2]
+    roi_box: tuple[int, int, int, int] | None = None
+    hm_full_f32: np.ndarray | None = None
+    if hint_mask is not None:
+        hm_tmp = hint_mask
+        if hm_tmp.ndim == 3:
+            hm_tmp = hm_tmp[:, :, 3] if hm_tmp.shape[2] == 4 else hm_tmp[:, :, 0]
+        if hm_tmp.dtype == np.uint8:
+            hm_full_f32 = hm_tmp.astype(np.float32) * (1.0 / 255.0)
+        elif hm_tmp.dtype == np.uint16:
+            hm_full_f32 = hm_tmp.astype(np.float32) * (1.0 / 65535.0)
+        else:
+            hm_full_f32 = hm_tmp.astype(np.float32, copy=False)
+            if float(hm_full_f32.max()) > 1.5:
+                hm_full_f32 = hm_full_f32 * (1.0 / 255.0)
+        hm_full_f32 = np.clip(hm_full_f32, 0.0, 1.0)
+        if auto_roi_crop and H_orig > 64 and W_orig > 64:
+            hm_for_bbox = hm_full_f32
+            if hm_for_bbox.shape[:2] != (H_orig, W_orig):
+                hm_for_bbox = cv2.resize(hm_for_bbox, (W_orig, H_orig), interpolation=cv2.INTER_NEAREST)
+            ys, xs = np.where(hm_for_bbox > 0.04)
+            if ys.size > 0:
+                pad_px = max(16, int(auto_roi_pad_px))
+                x0 = max(0, int(xs.min()) - pad_px)
+                y0 = max(0, int(ys.min()) - pad_px)
+                x1 = min(W_orig, int(xs.max()) + 1 + pad_px)
+                y1 = min(H_orig, int(ys.max()) + 1 + pad_px)
+                if (x1 - x0) < 64:
+                    cx = (x0 + x1) // 2
+                    x0 = max(0, min(W_orig - 64, cx - 32))
+                    x1 = min(W_orig, x0 + 64)
+                if (y1 - y0) < 64:
+                    cy = (y0 + y1) // 2
+                    y0 = max(0, min(H_orig - 64, cy - 32))
+                    y1 = min(H_orig, y0 + 64)
+                if (x1 - x0) * (y1 - y0) < int(0.85 * H_orig * W_orig):
+                    roi_box = (x0, y0, x1, y1)
+                    rgb_f_full = rgb_f
+                    rgb_f = rgb_f[y0:y1, x0:x1]
+                    hint_mask = hm_for_bbox[y0:y1, x0:x1]
+
+    H_out, W_out = rgb_f.shape[:2]
+    h_model, w_model = scaled_hw(H_out, W_out, float(model_scale))
+    q = max(64, int(shape_quantum))
+    if q % 64 != 0:
+        q = 128
+    h_pad = ceil_to_multiple(h_model, q)
+    w_pad = ceil_to_multiple(w_model, q)
+    pad_l = (w_pad - w_model) // 2
+    pad_r = w_pad - w_model - pad_l
+    pad_t = (h_pad - h_model) // 2
+    pad_b = h_pad - h_model - pad_t
+
+    meta = {
+        "output_hw": (H_out, W_out),
+        "model_native_hw": (h_model, w_model),
+        "pad": (pad_l, pad_r, pad_t, pad_b),
+        "linear_brightness": float(linear_brightness),
+        "linear_contrast": float(linear_contrast),
+        "linear_contrast_pivot": float(linear_contrast_pivot),
+    }
+
+    if is_linear:
+        linear_native = np.maximum(rgb_f, 0.0)
+        display_native = np.clip(cu.linear_to_srgb(linear_native), 0.0, 1.0)
+    else:
+        display_native = np.clip(rgb_f, 0.0, 1.0)
+        linear_native = cu.srgb_to_linear(display_native)
+
+    display_scaled = resize_hwc_lanczos(display_native, (h_model, w_model))
+    linear_scaled = resize_hwc_lanczos(linear_native, (h_model, w_model))
+
+    if has_linear_adjust(meta):
+        linear_adj = apply_linear_adjust(linear_scaled, meta)
+        foundation_np = np.clip(cu.linear_to_vfm_sdr(linear_adj), 0.0, 1.0)
+    else:
+        linear_adj = linear_scaled
+        foundation_np = display_scaled
+
+    linear_adj_pad, _ = center_pad_to_shape(linear_adj, h_pad, w_pad)
+    foundation_pad, _ = center_pad_to_shape(foundation_np, h_pad, w_pad)
+
+    rgb_asinh_np = cu.linear_to_asinh(linear_adj_pad).astype(np.float32, copy=False)
+
+    dev_str = _target_device_str()
+    device = torch.device(dev_str)
+    dt = _amp_dtype() if device.type == "cuda" else torch.float32
+
+    rgb_t = (
+        torch.from_numpy(np.ascontiguousarray(rgb_asinh_np.transpose(2, 0, 1)))
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .to(device=device, dtype=dt)
+    )
+    rgb_vfm = (
+        torch.from_numpy(np.ascontiguousarray(foundation_pad.transpose(2, 0, 1)))
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .to(device=device, dtype=dt)
+    )
+    rgb_radio, rgb_moge = _build_foundation_inputs(rgb_vfm)
+
+    if hint_mask is not None:
+        hm = hint_mask
+        if hm.ndim == 3:
+            hm = hm[:, :, 3] if hm.shape[2] == 4 else hm[:, :, 0]
+        if hm.dtype == np.uint8:
+            hm_f = hm.astype(np.float32) * (1.0 / 255.0)
+        elif hm.dtype == np.uint16:
+            hm_f = hm.astype(np.float32) * (1.0 / 65535.0)
+        else:
+            hm_f = hm.astype(np.float32, copy=False)
+            if float(hm_f.max()) > 1.5:
+                hm_f = hm_f * (1.0 / 255.0)
+        hm_f = np.clip(hm_f, 0.0, 1.0)
+        if hm_f.shape[:2] != (h_model, w_model):
+            hm_f = cv2.resize(hm_f, (w_model, h_model), interpolation=cv2.INTER_LINEAR)
+        hm_pad, _ = center_pad_to_shape(hm_f, h_pad, w_pad)
+        hint_t = (
+            torch.from_numpy(np.ascontiguousarray(hm_pad))
+            .view(1, 1, 1, h_pad, w_pad)
+            .to(device=device, dtype=dt)
+        )
+        hq_t = torch.full((1, 1), float(hint_quality), device=device, dtype=dt)
+    else:
+        hint_t = torch.zeros((1, 1, 1, h_pad, w_pad), device=device, dtype=dt)
+        hq_t = torch.zeros((1, 1), device=device, dtype=dt)
+
+    cfg = InferenceConfig(low_vram=bool(low_vram))
+    configure_low_vram_inference(model, cfg)
+    model.eval()
+
+    try:
+        model.to(device)
+        with torch.inference_mode(), _autocast_ctx(device):
+            out = model(
+                rgb_t,
+                hint_t,
+                rgb_cradio=rgb_radio,
+                rgb_moge=rgb_moge,
+                hint_quality=hq_t,
+            )
+
+        alpha_model = out["alpha"][:, 0].float()
+        pa_native = _crop_native_torch(alpha_model, meta).clamp(0.0, 1.0)
+        pa = _resize_output_torch(pa_native, meta).clamp(0.0, 1.0)
+        alpha_raw = (
+            pa[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+        )
+
+        fg_model = out["fg"][:, 0].float()
+        pf_native = _crop_native_torch(fg_model, meta)
+        pf_lin = _linear_adjust_inverse_torch(cu.asinh_to_linear(pf_native), meta)
+        pf_lin_out = _resize_output_torch(pf_lin, meta)
+        fg_linear = (
+            pf_lin_out[0].permute(1, 2, 0).contiguous().cpu().numpy().astype(np.float32, copy=False)
+        )
+        fg_raw = np.clip(cu.linear_to_srgb(np.maximum(fg_linear, 0.0)), 0.0, 1.0).astype(
+            np.float32, copy=False
+        )
+        if roi_box is not None:
+            x0, y0, x1, y1 = roi_box
+            alpha_full = np.zeros((H_orig, W_orig), dtype=np.float32)
+            alpha_full[y0:y1, x0:x1] = alpha_raw
+            if is_linear:
+                fg_lin_full = np.maximum(rgb_f_full, 0.0).astype(np.float32, copy=True)
+                fg_raw_full = np.clip(cu.linear_to_srgb(fg_lin_full), 0.0, 1.0).astype(np.float32, copy=False)
+            else:
+                fg_raw_full = np.clip(rgb_f_full, 0.0, 1.0).astype(np.float32, copy=True)
+                fg_lin_full = cu.srgb_to_linear(fg_raw_full).astype(np.float32, copy=False)
+            fg_raw_full[y0:y1, x0:x1] = fg_raw
+            fg_lin_full[y0:y1, x0:x1] = fg_linear
+            alpha_raw = alpha_full
+            fg_raw = fg_raw_full
+            fg_linear = fg_lin_full
+        return {
+            "alpha_raw": alpha_raw,
+            "fg_raw": fg_raw,
+            "fg_linear": fg_linear,
+        }
+    finally:
+        del rgb_t, rgb_vfm, rgb_radio, rgb_moge, hint_t, hq_t
+        try:
+            if hasattr(model, "foundations"):
+                model.foundations.cpu()
+            if hasattr(model, "stage1"):
+                model.stage1.cpu()
+            if hasattr(model, "stage2"):
+                model.stage2.cpu()
+            model.cpu()
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

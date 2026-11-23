@@ -117,7 +117,7 @@ def get_tracker_model_cache_dir() -> Path:
 
 def get_local_ffmpeg_dir() -> Path:
     """Return the repo-local bundled FFmpeg folder."""
-    return Path(__file__).resolve().parents[2] / "tools" / "ffmpeg"
+    return Path(__file__).resolve().parents[2] / "ffmpeg"
 
 
 class _FFmpegRepairWorker(QThread):
@@ -397,57 +397,6 @@ class PreferencesDialog(QDialog):
 
         # (added to layout below in display order)
 
-        # Tracking section
-        tracking_group = QGroupBox(self.tr("Tracking"))
-        tracking_layout = QVBoxLayout(tracking_group)
-
-        tracking_label = QLabel(self.tr("SAM 3.1 model"))
-        tracking_layout.addWidget(tracking_label)
-
-        self._tracker_model_combo = _no_scroll_wheel(QComboBox())
-        saved_model = get_setting_str(KEY_TRACKER_MODEL, DEFAULT_TRACKER_MODEL)
-        for label, size, model_id in TRACKER_MODEL_OPTIONS:
-            self._tracker_model_combo.addItem(self.tr("%s  (%s)") % (self.tr(label), size), model_id)
-        idx = self._tracker_model_combo.findData(saved_model)
-        self._tracker_model_combo.setCurrentIndex(max(0, idx))
-        self._tracker_model_combo.setToolTip(
-            self.tr(
-                "Fast: lower VRAM, lower quality.\n"
-                "Base+: best default tradeoff for this app.\n"
-                "Highest Quality: slowest, heaviest tracker."
-            )
-        )
-        tracking_layout.addWidget(self._tracker_model_combo)
-
-        tracking_info = QLabel(
-            self.tr(
-                "Models download automatically on first use. "
-                "Download progress appears in the status bar."
-            )
-        )
-        tracking_info.setWordWrap(True)
-        tracking_info.setStyleSheet("color: #999980; font-size: 11px;")
-        tracking_layout.addWidget(tracking_info)
-
-        manage_label = QLabel(self.tr("Manage models"))
-        tracking_layout.addWidget(manage_label)
-
-        self._tracker_cache_dir = get_tracker_model_cache_dir()
-        cache_row = QHBoxLayout()
-        cache_row.setSpacing(8)
-        self._cache_path_label = QLabel(str(self._tracker_cache_dir))
-        self._cache_path_label.setWordWrap(True)
-        self._cache_path_label.setStyleSheet("color: #999980; font-size: 11px;")
-        self._cache_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        cache_row.addWidget(self._cache_path_label, 1)
-
-        open_cache_btn = QPushButton(self.tr("Open Cache Folder"))
-        open_cache_btn.clicked.connect(self._open_tracker_cache_dir)
-        cache_row.addWidget(open_cache_btn)
-        tracking_layout.addLayout(cache_row)
-
-        # (added to layout below in display order)
-
         # Model downloads now live in Edit > Download Manager (not Preferences).
 
         ffmpeg_group = QGroupBox(self.tr("Video Tools"))
@@ -550,7 +499,6 @@ class PreferencesDialog(QDialog):
         layout.addWidget(ui_group)
         layout.addWidget(proj_group)
         layout.addWidget(play_group)
-        layout.addWidget(tracking_group)
         layout.addWidget(inference_group)
         layout.addWidget(output_group)
         layout.addWidget(privacy_group)
@@ -582,6 +530,12 @@ class PreferencesDialog(QDialog):
             event.ignore()
             return
         super().closeEvent(event)
+
+    def reject(self) -> None:
+        """Prevent dismissing the dialog via Esc/Cancel while FFmpeg repair is active."""
+        if self._ffmpeg_repair_worker is not None and self._ffmpeg_repair_worker.isRunning():
+            return
+        super().reject()
 
     def _populate_available_languages(self) -> None:
         """Scan ui/translations/ for .qm files and add them to the combo."""
@@ -633,7 +587,7 @@ class PreferencesDialog(QDialog):
         s.setValue(KEY_COPY_SEQUENCES, self._copy_sequences_cb.isChecked())
         s.setValue(KEY_LOOP_PLAYBACK, self._loop_cb.isChecked())
         s.setValue(KEY_EXR_COMPRESSION, self._exr_compression_combo.currentData())
-        s.setValue(KEY_TRACKER_MODEL, self._tracker_model_combo.currentData())
+        s.setValue(KEY_TRACKER_MODEL, DEFAULT_TRACKER_MODEL)
         s.setValue(KEY_MODEL_RESOLUTION, self._model_resolution_combo.currentData())
         if self._backend_combo is not None:
             s.setValue(KEY_INFERENCE_BACKEND, self._backend_combo.currentData())
@@ -655,9 +609,13 @@ class PreferencesDialog(QDialog):
             self._output_dir_edit.setText(path)
 
     def _open_tracker_cache_dir(self) -> None:
-        """Open the local cache folder where SAM 3.1 checkpoints are stored."""
-        self._tracker_cache_dir.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._tracker_cache_dir)))
+        """Open the local Hugging Face hub cache folder."""
+        cache_dir = getattr(self, "_tracker_cache_dir", None)
+        if cache_dir is None:
+            from pathlib import Path
+            cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(cache_dir)))
 
     def _on_browse_ffmpeg(self) -> None:
         """Let the user point CorridorKey at their own FFmpeg folder."""
@@ -737,6 +695,7 @@ class PreferencesDialog(QDialog):
     def _set_ffmpeg_repair_busy(self, busy: bool) -> None:
         """Disable controls while a repair is running."""
         self._repair_ffmpeg_btn.setEnabled(not busy)
+        self._browse_ffmpeg_btn.setEnabled(not busy)
         self._open_ffmpeg_btn.setEnabled(not busy and self._local_ffmpeg_dir.exists())
         self._cancel_btn.setEnabled(not busy)
         self._ok_btn.setEnabled(not busy)
@@ -854,5 +813,6 @@ class PreferencesDialog(QDialog):
 
     @property
     def tracker_model(self) -> str:
-        data = self._tracker_model_combo.currentData()
+        combo = getattr(self, "_tracker_model_combo", None)
+        data = combo.currentData() if combo is not None else None
         return str(data or DEFAULT_TRACKER_MODEL)

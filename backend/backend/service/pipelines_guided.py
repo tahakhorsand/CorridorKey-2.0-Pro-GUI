@@ -205,7 +205,9 @@ class GuidedPipelinesMixin:
                     negative_points=prompt.negative_points,
                     box=prompt.box,
                     hair_points=getattr(prompt, "hair_points", []),
+                    hair_strokes=getattr(prompt, "hair_strokes", []),
                     negative_strokes=getattr(prompt, "negative_strokes", []),
+                    object_id=int(getattr(prompt, "object_id", 1) or 1),
                 )
                 for prompt in prompt_frames
             ]
@@ -232,27 +234,29 @@ class GuidedPipelinesMixin:
 
             try:
 
-                masks = tracker.track_video(
+                with self._gpu_lock:
 
-                    [frame for _, frame in named_frames],
+                    masks = tracker.track_video(
 
-                    local_prompts,
+                        [frame for _, frame in named_frames],
 
-                    on_progress=(
+                        local_prompts,
 
-                        None
+                        on_progress=(
 
-                        if on_progress is None
+                            None
 
-                        else lambda current, total: on_progress(clip.name, current, total)
+                            if on_progress is None
 
-                    ),
+                            else lambda current, total: on_progress(clip.name, current, total)
 
-                    on_status=on_status,
+                        ),
 
-                    check_cancel=_check_cancel,
+                        on_status=on_status,
 
-                )
+                        check_cancel=_check_cancel,
+
+                    )
 
             except SAM3NotInstalledError as exc:
 
@@ -272,15 +276,13 @@ class GuidedPipelinesMixin:
 
 
 
-            mask_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
             sam_dir = os.path.join(clip.root_path, "SamMaskHint")
             alpha_dir = os.path.join(clip.root_path, "AlphaHint")
 
-            os.makedirs(mask_dir, exist_ok=True)
             os.makedirs(sam_dir, exist_ok=True)
             os.makedirs(alpha_dir, exist_ok=True)
 
-            for d in (mask_dir, sam_dir, alpha_dir):
+            for d in (sam_dir, alpha_dir):
                 for fname in os.listdir(d):
                     if fname.lower().endswith((".png", ".jpg", ".jpeg")):
                         os.remove(os.path.join(d, fname))
@@ -289,29 +291,20 @@ class GuidedPipelinesMixin:
             for (fname, _), mask in zip(named_frames, masks):
                 stem = os.path.splitext(fname)[0]
                 stems.append(stem)
-                out_mask_path = os.path.join(mask_dir, f"{stem}.png")
                 out_sam_path = os.path.join(sam_dir, f"{stem}.png")
                 out_alpha_path = os.path.join(alpha_dir, f"{stem}.png")
-                if not imwrite_unicode(out_mask_path, mask):
-                    raise WriteFailureError(clip.name, len(stems) - 1, out_mask_path)
-                imwrite_unicode(out_sam_path, mask)
+                if not imwrite_unicode(out_sam_path, mask):
+                    raise WriteFailureError(clip.name, len(stems) - 1, out_sam_path)
                 imwrite_unicode(out_alpha_path, mask)
 
-
-
             self._write_mask_track_manifest(
-
                 clip,
-
                 source="sam3",
-
                 frame_stems=stems,
-
                 model_id=getattr(tracker, "model_id", "sam3.1-INT8-ConvRot"),
-
             )
 
-            clip.mask_asset = ClipAsset(mask_dir, "sequence")
+            clip.mask_asset = ClipAsset(sam_dir, "sequence")
             clip.alpha_asset = ClipAsset(alpha_dir, "sequence")
             clip.find_assets()
             clip.state = ClipState.READY
@@ -324,16 +317,10 @@ class GuidedPipelinesMixin:
                 except OSError:
                     pass
 
-
-
             logger.info(
-
-                "SAM 3.1 tracking complete for '%s': %d dense masks written to AlphaHint & VideoMamaMaskHint",
-
+                "SAM 3.1 tracking complete for '%s': %d dense masks written to AlphaHint & SamMaskHint",
                 clip.name,
-
                 len(stems),
-
             )
 
         finally:
@@ -510,14 +497,22 @@ class GuidedPipelinesMixin:
 
 
 
-            local_prompt = PromptFrame(
-                frame_index=0,
-                positive_points=prompt.positive_points,
-                negative_points=prompt.negative_points,
-                box=prompt.box,
-                hair_points=getattr(prompt, "hair_points", []),
-                negative_strokes=getattr(prompt, "negative_strokes", []),
-            )
+            target_frame = prompt.frame_index
+            matching_prompts = [item for item in prompt_frames if item.frame_index == target_frame]
+
+            local_prompts = [
+                PromptFrame(
+                    frame_index=0,
+                    positive_points=item.positive_points,
+                    negative_points=item.negative_points,
+                    box=item.box,
+                    hair_points=getattr(item, "hair_points", []),
+                    hair_strokes=getattr(item, "hair_strokes", []),
+                    negative_strokes=getattr(item, "negative_strokes", []),
+                    object_id=int(getattr(item, "object_id", 1) or 1),
+                )
+                for item in matching_prompts
+            ]
 
 
 
@@ -525,27 +520,29 @@ class GuidedPipelinesMixin:
 
             try:
 
-                masks = tracker.track_video(
+                with self._gpu_lock:
 
-                    [named_frames[0][1]],
+                    masks = tracker.track_video(
 
-                    [local_prompt],
+                        [named_frames[0][1]],
 
-                    on_progress=(
+                        local_prompts,
 
-                        None
+                        on_progress=(
 
-                        if on_progress is None
+                            None
 
-                        else lambda current, total: on_progress(clip.name, current, total)
+                            if on_progress is None
 
-                    ),
+                            else lambda current, total: on_progress(clip.name, current, total)
 
-                    on_status=on_status,
+                        ),
 
-                    check_cancel=_check_cancel,
+                        on_status=on_status,
 
-                )
+                        check_cancel=_check_cancel,
+
+                    )
 
             except SAM3NotInstalledError as exc:
 
@@ -651,15 +648,6 @@ class GuidedPipelinesMixin:
         clip.alpha_asset = ClipAsset(alpha_dir, "sequence")
         if source == "sam3":
             clip.mask_asset = ClipAsset(target_dir, "sequence")
-            vmama_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
-            os.makedirs(vmama_dir, exist_ok=True)
-            for fname in os.listdir(vmama_dir):
-                if fname.lower().endswith((".png", ".jpg", ".jpeg")):
-                    try:
-                        os.remove(os.path.join(vmama_dir, fname))
-                    except OSError:
-                        pass
-            imwrite_unicode(os.path.join(vmama_dir, f"{stem}.png"), mask_u8)
 
         try:
             clip.find_assets()

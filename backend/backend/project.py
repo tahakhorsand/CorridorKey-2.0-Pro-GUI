@@ -71,10 +71,17 @@ def get_data_dir() -> str:
         pass
     # Platform default
     if sys.platform == "win32":
-        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "EZ-CorridorKey")
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        preferred = os.path.join(base, "CorridorKey 2.0")
+        legacy = os.path.join(base, "EZ-CorridorKey")
+        return legacy if (not os.path.exists(preferred) and os.path.exists(legacy)) else preferred
     elif sys.platform == "darwin":
-        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "EZ-CorridorKey")
-    return os.path.join(os.path.expanduser("~"), ".local", "share", "EZ-CorridorKey")
+        preferred = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "CorridorKey 2.0")
+        legacy = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "EZ-CorridorKey")
+        return legacy if (not os.path.exists(preferred) and os.path.exists(legacy)) else preferred
+    preferred = os.path.join(os.path.expanduser("~"), ".local", "share", "CorridorKey 2.0")
+    legacy = os.path.join(os.path.expanduser("~"), ".local", "share", "EZ-CorridorKey")
+    return legacy if (not os.path.exists(preferred) and os.path.exists(legacy)) else preferred
 
 
 def projects_root() -> str:
@@ -106,7 +113,7 @@ def sanitize_stem(filename: str, max_len: int = 60) -> str:
     stem = os.path.splitext(filename)[0]
     stem = re.sub(r"[^\w\-]", "_", stem)
     stem = re.sub(r"_+", "_", stem).strip("_")
-    return stem[:max_len]
+    return (stem[:max_len] or "clip")
 
 
 def create_project(
@@ -161,11 +168,10 @@ def create_project(
     # Deduplicate if folder already exists (e.g. rapid imports)
     project_dir = os.path.join(root, folder_name)
     if os.path.exists(project_dir):
-        for i in range(2, 100):
-            candidate = os.path.join(root, f"{folder_name}_{i}")
-            if not os.path.exists(candidate):
-                project_dir = candidate
-                break
+        i = 2
+        while os.path.exists(os.path.join(root, f"{folder_name}_{i}")):
+            i += 1
+        project_dir = os.path.join(root, f"{folder_name}_{i}")
 
     clips_dir = os.path.join(project_dir, "clips")
     os.makedirs(clips_dir, exist_ok=True)
@@ -236,18 +242,20 @@ def _copy_companion_hints(video_path: str, clip_dir: str) -> None:
     ``{source_stem}_{keyword}.{ext}`` (case insensitive), where keyword
     is "alphahint" or "maskhint":
     ☼ ``MyClip_AlphaHint.mov`` -> ``AlphaHint.mov`` at clip root
-    ☼ ``MyClip_MaskHint.mov``  -> ``VideoMamaMaskHint.mov`` at clip root
+    ☼ ``MyClip_MaskHint.mov``  -> ``SamMaskHint.mov`` at clip root
 
     The hint file must contain both the keyword and the source video's stem
     so that ``Shot01_AlphaHint.mp4`` matches ``Shot01.mp4`` but not ``Shot02.mp4``.
     """
-    parent = os.path.dirname(video_path)
+    parent = os.path.dirname(os.path.abspath(video_path))
+    if not parent or not os.path.isdir(parent):
+        return
     video_basename = os.path.basename(video_path).lower()
     source_stem = os.path.splitext(video_basename)[0]
 
     _KEYWORD_MAP = {
         "alphahint": "AlphaHint",
-        "maskhint": "VideoMamaMaskHint",
+        "maskhint": "SamMaskHint",
     }
 
     found: dict[str, bool] = {}
@@ -261,8 +269,8 @@ def _copy_companion_hints(video_path: str, clip_dir: str) -> None:
         for keyword, dest_name in _KEYWORD_MAP.items():
             if keyword in found:
                 continue
-            # Hint must contain both the keyword AND the source stem
-            if keyword in f_stem and source_stem in f_stem:
+            # Hint must contain both the keyword AND the source stem at a boundary
+            if keyword in f_stem and re.search(rf"(?:^|[\s_\-.]){re.escape(source_stem)}(?:$|[\s_\-.])", f_stem):
                 _, real_ext = os.path.splitext(f)
                 dst = os.path.join(clip_dir, f"{dest_name}{real_ext}")
                 src = os.path.join(parent, f)
@@ -288,12 +296,11 @@ def _create_clip_folder(
     # Deduplicate clip folder names within same project
     clip_dir = os.path.join(clips_dir, clip_name)
     if os.path.exists(clip_dir):
-        for i in range(2, 100):
-            candidate = os.path.join(clips_dir, f"{clip_name}_{i}")
-            if not os.path.exists(candidate):
-                clip_dir = candidate
-                clip_name = f"{clip_name}_{i}"
-                break
+        i = 2
+        while os.path.exists(os.path.join(clips_dir, f"{clip_name}_{i}")):
+            i += 1
+        clip_name = f"{clip_name}_{i}"
+        clip_dir = os.path.join(clips_dir, clip_name)
 
     source_dir = os.path.join(clip_dir, "Source")
     os.makedirs(source_dir, exist_ok=True)
@@ -390,7 +397,7 @@ def write_project_json(project_root: str, data: dict) -> None:
     """Atomic write of project.json."""
     path = os.path.join(project_root, "project.json")
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as f:
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, path)
 
@@ -401,7 +408,7 @@ def read_project_json(project_root: str) -> dict | None:
     if not os.path.isfile(path):
         return None
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"Failed to read project.json at {path}: {e}")
@@ -412,7 +419,7 @@ def write_clip_json(clip_root: str, data: dict) -> None:
     """Atomic write of clip.json (per-clip metadata)."""
     path = os.path.join(clip_root, "clip.json")
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as f:
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, path)
 
@@ -423,7 +430,7 @@ def read_clip_json(clip_root: str) -> dict | None:
     if not os.path.isfile(path):
         return None
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"Failed to read clip.json at {path}: {e}")
@@ -509,6 +516,24 @@ def load_chroma_params(clip_root: str) -> dict | None:
     data = _read_clip_or_project_json(clip_root)
     if data and "chroma_params" in data:
         return data["chroma_params"]
+    return None
+
+
+def save_inference_params(clip_root: str, params: dict | None) -> None:
+    """Persist per-clip InferenceParams to clip.json. Pass None to clear."""
+    data = read_clip_json(clip_root) or {}
+    if params:
+        data["inference_params"] = dict(params)
+    else:
+        data.pop("inference_params", None)
+    write_clip_json(clip_root, data)
+
+
+def load_inference_params(clip_root: str) -> dict | None:
+    """Load per-clip InferenceParams from clip.json, or None if not set."""
+    data = _read_clip_or_project_json(clip_root)
+    if data and isinstance(data.get("inference_params"), dict):
+        return dict(data["inference_params"])
     return None
 
 

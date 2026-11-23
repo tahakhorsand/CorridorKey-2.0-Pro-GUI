@@ -97,6 +97,7 @@ def scan_clips_dir(
     if is_v2_project(clips_dir):
         return scan_project_clips(clips_dir)
 
+    seen_paths: set[str] = set()
     seen_names: set[str] = set()
 
     for item in sorted(os.listdir(clips_dir)):
@@ -112,16 +113,21 @@ def scan_clips_dir(
             if is_v2_project(item_path):
                 # v2 project: scan its clips/ subdirectory
                 for clip in scan_project_clips(item_path):
-                    if clip.name not in seen_names:
+                    norm_p = os.path.normcase(os.path.abspath(clip.root_path))
+                    if norm_p not in seen_paths:
                         entries.append(clip)
+                        seen_paths.add(norm_p)
                         seen_names.add(clip.name)
             else:
                 # Flat clip dir or v1 project
                 clip = ClipEntry(name=item, root_path=item_path)
                 try:
                     clip.find_assets()
-                    entries.append(clip)
-                    seen_names.add(clip.name)
+                    norm_p = os.path.normcase(os.path.abspath(clip.root_path))
+                    if norm_p not in seen_paths:
+                        entries.append(clip)
+                        seen_paths.add(norm_p)
+                        seen_names.add(clip.name)
                 except ClipScanError as e:
                     # Skip folders without valid input assets
                     logger.debug(str(e))

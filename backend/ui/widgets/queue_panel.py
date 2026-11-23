@@ -37,16 +37,18 @@ _ROW_H = 60
 class _JobRowCache:
     """Cached widgets for a single job row, enabling in-place updates."""
     __slots__ = ("frame", "progress_bar", "frame_label", "status_label",
-                 "dismiss_btn", "last_status", "last_current", "last_total")
+                 "dismiss_btn", "cancel_btn", "last_status", "last_current", "last_total")
 
     def __init__(self, frame: QFrame, progress_bar: QProgressBar | None,
                  frame_label: QLabel | None, status_label: QLabel | None,
-                 dismiss_btn: QPushButton | None = None):
+                 dismiss_btn: QPushButton | None = None,
+                 cancel_btn: QPushButton | None = None):
         self.frame = frame
         self.progress_bar = progress_bar
         self.frame_label = frame_label
         self.status_label = status_label
         self.dismiss_btn = dismiss_btn
+        self.cancel_btn = cancel_btn
         self.last_status: JobStatus | None = None
         self.last_current: int = -1
         self.last_total: int = -1
@@ -60,6 +62,7 @@ class QueuePanel(QWidget):
     """
 
     cancel_job_requested = Signal(str)  # job_id
+    pause_toggled = Signal(bool)        # True = paused, False = running
 
     def __init__(self, queue: GPUJobQueue, parent=None):
         super().__init__(parent)
@@ -133,6 +136,20 @@ class QueuePanel(QWidget):
 
         header_layout.addStretch()
 
+        self._pause_btn = QPushButton(self.tr("Pause"))
+        self._pause_btn.setCheckable(True)
+        self._pause_btn.setFixedHeight(18)
+        self._pause_btn.setCursor(Qt.PointingHandCursor)
+        self._pause_btn.setStyleSheet(
+            "QPushButton { font-size: 9px; padding: 1px 6px; "
+            "background: transparent; border: 1px solid #2A2910; color: #CCCCAA; }"
+            "QPushButton:checked { background: #2B2400; border-color: #FFF203; color: #FFF203; font-weight: 700; }"
+            "QPushButton:hover { border-color: #FFF203; }"
+        )
+        self._pause_btn.setToolTip(self.tr("Pause/Resume queued jobs after active frame/job completes"))
+        self._pause_btn.toggled.connect(self._on_pause_toggled)
+        header_layout.addWidget(self._pause_btn)
+
         self._clear_btn = QPushButton(self.tr("Clear"))
         self._clear_btn.setFixedHeight(18)
         self._clear_btn.setCursor(Qt.PointingHandCursor)
@@ -166,6 +183,29 @@ class QueuePanel(QWidget):
 
         scroll.setWidget(self._job_container)
         panel_layout.addWidget(scroll, 1)
+
+        footer = QWidget()
+        footer.setFixedHeight(26)
+        footer.setStyleSheet("background: #141300; border-top: 1px solid #2A2910;")
+        f_layout = QHBoxLayout(footer)
+        f_layout.setContentsMargins(8, 2, 6, 2)
+        f_layout.setSpacing(6)
+        after_lbl = QLabel(self.tr("After:"))
+        after_lbl.setStyleSheet("color: #808070; font-size: 10px; border: none;")
+        f_layout.addWidget(after_lbl)
+        from PySide6.QtWidgets import QComboBox
+        self._after_combo = QComboBox()
+        self._after_combo.setFixedHeight(20)
+        self._after_combo.setStyleSheet(
+            "QComboBox { background: #1A1900; color: #CCCCAA; font-size: 10px; border: 1px solid #2A2910; padding: 0 4px; }"
+            "QComboBox QAbstractItemView { background: #1A1900; color: #E0E0E0; }"
+        )
+        self._after_combo.addItem(self.tr("Do Nothing"), "none")
+        self._after_combo.addItem(self.tr("Beep"), "beep")
+        self._after_combo.addItem(self.tr("Open Output Folder"), "open_folder")
+        self._after_combo.addItem(self.tr("Close App"), "close_app")
+        f_layout.addWidget(self._after_combo, 1)
+        panel_layout.addWidget(footer)
 
         self._panel.hide()
         self._main_layout.addWidget(self._panel)
@@ -319,6 +359,24 @@ class QueuePanel(QWidget):
 
         top.addStretch()
 
+        job_id = job.id
+        cancel_btn = QPushButton("\u2715")  # ✕
+        cancel_btn.setFixedSize(16, 16)
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.setStyleSheet(
+            "QPushButton { background: transparent; color: #D97706; "
+            "font-size: 9px; font-weight: 700; border: none; padding: 0; }"
+            "QPushButton:hover { color: #EF4444; }"
+        )
+        cancel_btn.setToolTip(self.tr("Cancel Job"))
+        cancel_btn.clicked.connect(
+            lambda checked, jid=job_id: self.cancel_job_requested.emit(jid)
+        )
+        cancel_btn.setVisible(
+            job.status in (JobStatus.QUEUED, JobStatus.RUNNING)
+        )
+        top.addWidget(cancel_btn)
+
         # Dismiss button -- always created, shown only once the job finishes.
         # Rows update in place as jobs progress, so a button created
         # conditionally at build time would never appear for jobs that
@@ -332,7 +390,6 @@ class QueuePanel(QWidget):
             "QPushButton:hover { color: #999980; }"
         )
         dismiss_btn.setToolTip(self.tr("Dismiss"))
-        job_id = job.id
         dismiss_btn.clicked.connect(
             lambda checked, jid=job_id: self._dismiss_job(jid)
         )
@@ -379,7 +436,7 @@ class QueuePanel(QWidget):
 
         layout.addLayout(bottom)
 
-        cache = _JobRowCache(row, progress_bar, frame_label, status_label, dismiss_btn)
+        cache = _JobRowCache(row, progress_bar, frame_label, status_label, dismiss_btn, cancel_btn)
         self._update_row_in_place(cache, job)
         return row, cache
 
@@ -387,6 +444,10 @@ class QueuePanel(QWidget):
         """Update a cached row's widgets to reflect current job state."""
         color = _STATUS_COLORS.get(job.status, "#808070")
         status_text = self._status_display(job.status)
+        if cache.cancel_btn is not None:
+            cache.cancel_btn.setVisible(
+                job.status in (JobStatus.QUEUED, JobStatus.RUNNING)
+            )
         if cache.dismiss_btn is not None:
             cache.dismiss_btn.setVisible(
                 job.status in (JobStatus.COMPLETED, JobStatus.CANCELLED, JobStatus.FAILED)
@@ -458,3 +519,10 @@ class QueuePanel(QWidget):
         """Clear job history."""
         self._queue.clear_history()
         self.refresh()
+
+    def _on_pause_toggled(self, paused: bool) -> None:
+        self._pause_btn.setText(self.tr("Resume") if paused else self.tr("Pause"))
+        self.pause_toggled.emit(bool(paused))
+
+    def after_queue_action(self) -> str:
+        return str(self._after_combo.currentData() or "none")

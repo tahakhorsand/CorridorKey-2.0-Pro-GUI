@@ -4,7 +4,7 @@
 
 Shown automatically when the required CorridorKey checkpoint is missing.
 
-Provides the same model selection as 1-install.sh / 1-install.bat but in
+Provides the same model selection as install.bat / setup scripts in
 
 a PySide6 GUI with checkboxes and progress bars.
 
@@ -88,7 +88,11 @@ def _default_install_dir() -> Path:
 
     if sys.platform == "darwin" and getattr(sys, "frozen", False):
 
-        return Path.home() / "Library" / "Application Support" / "EZ-CorridorKey"
+        preferred = Path.home() / "Library" / "Application Support" / "CorridorKey 2.0"
+
+        legacy = Path.home() / "Library" / "Application Support" / "EZ-CorridorKey"
+
+        return legacy if (not preferred.exists() and legacy.exists()) else preferred
 
     if getattr(sys, "frozen", False):
 
@@ -221,7 +225,17 @@ def _saved_install_path() -> Path:
 
 def _current_version() -> str:
 
-    """Read version from pyproject.toml (frozen or dev). 0.0.0 on failure."""
+    """Return central app version (with pyproject.toml fallback)."""
+
+    try:
+
+        from backend import APP_VERSION
+
+        return APP_VERSION
+
+    except Exception:
+
+        pass
 
     try:
 
@@ -229,7 +243,7 @@ def _current_version() -> str:
 
     except Exception:
 
-        return "0.0.0"
+        return "2.0.0"
 
     candidates: list[Path] = []
 
@@ -251,7 +265,7 @@ def _current_version() -> str:
 
             continue
 
-    return "0.0.0"
+    return "2.0.0"
 
 
 
@@ -324,11 +338,19 @@ def detect_installed_models(install_path: Path | None = None) -> dict[str, bool]
 
     foundation_stats = (root / "weights" / "foundation_stats.safetensors").is_file()
 
-    vfms_present = (root / "vfms" / "rvm").is_dir() and (root / "vfms" / "moge").is_dir()
+    cradio_dir = root / "vfms" / "cradio" / "C-RADIOv4-SO400M"
+    cradio_present = cradio_dir.is_dir() and any(
+        (cradio_dir / f).is_file() for f in ("model.safetensors", "config.json")
+    )
+    vfms_present = (
+        (root / "vfms" / "rvm" / "pretrain_rvm_small16_256_204031069.npz").is_file()
+        and (root / "vfms" / "moge" / "model.pt").is_file()
+        and cradio_present
+    )
 
 
 
-    results["corridorkey"] = v2_safetensors
+    results["corridorkey"] = v2_safetensors and foundation_stats
 
     results["foundation_stats"] = foundation_stats
 
@@ -352,18 +374,13 @@ def detect_installed_models(install_path: Path | None = None) -> dict[str, bool]
 
 
 
-    # SAM 3.1 Base+ needs BOTH the Python package (installed by the installer,
-
-    # not the wizard) and the checkpoint in the HF hub cache (shared across
-
-    # installs). Checking only the cache reported "installed" while the
-
-    # runtime import still failed (issue #157).
-
-    results["sam3"] = _sam3_package_available() and _hf_cache_has(
-
-        "facebook/sam3.1-hiera-base-plus", hf
-
+    # SAM 3.1 Native INT8 ConvRot + tracker head stored under weights/sam3/
+    sam_dir = root / "weights" / "sam3"
+    sam_bundled = _project_root() / "weights" / "sam3"
+    results["sam3"] = any(
+        (d / "sam3.1-INT8-ConvRot.safetensors").is_file()
+        and (d / "sam3.1-tracker-head.safetensors").is_file()
+        for d in (sam_dir, sam_bundled)
     )
 
 
@@ -376,21 +393,22 @@ def detect_installed_models(install_path: Path | None = None) -> dict[str, bool]
 
 
 
-    # BiRefNet default Matting variant — any .safetensors in the snapshot dir
-
+    # All 9 BiRefNet variants — use same snapshot check as runtime (model.safetensors + config.json)
+    from modules.BiRefNetModule.wrapper import resolve_birefnet_snapshot
     brn_dir = root / "modules" / "BiRefNetModule" / "checkpoints" / "BiRefNet-matting"
-
     try:
-
-        results["birefnet"] = brn_dir.is_dir() and any(
-
-            p.suffix == ".safetensors" for p in brn_dir.iterdir() if p.is_file()
-
+        brn_local = (
+            brn_dir.is_dir()
+            and (brn_dir / "config.json").is_file()
+            and any(p.suffix == ".safetensors" for p in brn_dir.iterdir() if p.is_file())
         )
-
     except OSError:
-
-        results["birefnet"] = False
+        brn_local = False
+    for bkey, (_, brepo, _, _) in _BIREFNET_DOWNLOAD_SPECS.items():
+        present = resolve_birefnet_snapshot(brepo, hf) is not None
+        if bkey == "birefnet":
+            present = present or brn_local
+        results[bkey] = present
 
 
 
@@ -496,6 +514,19 @@ _IS_APPLE_SILICON = sys.platform == "darwin" and platform.machine() == "arm64"
 
 
 
+_BIREFNET_DOWNLOAD_SPECS: dict[str, tuple[str, str, str, str]] = {
+    "birefnet": ("BiRefNet Matting (Default)", "ZhengPeng7/BiRefNet-matting", "885 MB", "Best for hair, fur & transparent edges (1024px)"),
+    "birefnet-general": ("BiRefNet General", "ZhengPeng7/BiRefNet", "885 MB", "General-purpose foreground segmentation (1024px)"),
+    "birefnet-hr-matting": ("BiRefNet HR Matting", "ZhengPeng7/BiRefNet_HR-Matting", "885 MB", "High-resolution fine matting (2048px)"),
+    "birefnet-hr": ("BiRefNet HR General", "ZhengPeng7/BiRefNet_HR", "885 MB", "High-resolution general segmentation (2048px)"),
+    "birefnet-dynamic-matting": ("BiRefNet Dynamic Matting", "ZhengPeng7/BiRefNet_dynamic-matting", "885 MB", "Dynamic resolution matting (1024px)"),
+    "birefnet-dynamic": ("BiRefNet Dynamic General", "ZhengPeng7/BiRefNet_dynamic", "885 MB", "Dynamic resolution general segmentation (1024px)"),
+    "birefnet-lite-matting": ("BiRefNet Lite Matting", "ZhengPeng7/BiRefNet_lite-matting", "178 MB", "Lightweight matting for low-VRAM GPUs (1024px)"),
+    "birefnet-lite-2k": ("BiRefNet Lite 2K", "ZhengPeng7/BiRefNet_lite-2K", "178 MB", "Lightweight high-res segmentation (2048px)"),
+    "birefnet-lite": ("BiRefNet Lite General", "ZhengPeng7/BiRefNet_lite", "178 MB", "Fastest lightweight general segmentation (1024px)"),
+}
+
+
 MODELS: list[dict] = [
 
     {
@@ -508,23 +539,7 @@ MODELS: list[dict] = [
 
         "required": True,
 
-        "description": "Unified deep visual foundation model for native-resolution keying",
-
-        "default_checked": True,
-
-    },
-
-    {
-
-        "key": "foundation_stats",
-
-        "label": "Foundation Stats",
-
-        "size": "5 KB",
-
-        "required": True,
-
-        "description": "Spatial and feature normalization statistics",
+        "description": "Unified deep visual foundation model for native-resolution keying (+ normalization stats)",
 
         "default_checked": True,
 
@@ -545,6 +560,34 @@ MODELS: list[dict] = [
         "default_checked": True,
 
     },
+
+    {
+
+        "key": "sam3",
+
+        "label": "SAM 3.1 Tracker (INT8 ConvRot)",
+
+        "size": "1.11 GB",
+
+        "required": False,
+
+        "description": "Interactive point/box mask tracking & multi-frame propagation",
+
+        "default_checked": False,
+
+    },
+
+    *[
+        {
+            "key": bkey,
+            "label": blabel,
+            "size": bsize,
+            "required": False,
+            "description": bdesc,
+            "default_checked": False,
+        }
+        for bkey, (blabel, _brepo, bsize, bdesc) in _BIREFNET_DOWNLOAD_SPECS.items()
+    ],
 
 ]
 
@@ -658,13 +701,13 @@ def mark_setup_seen() -> None:
 
 def _load_setup_models():
 
-    script_path = _project_root() / "scripts" / "setup_models.py"
+    script_path = _project_root() / "scripts" / "download_weights.py"
 
     if not script_path.is_file():
 
-        raise ImportError(f"setup_models.py not found at {script_path}")
+        raise ImportError(f"download_weights.py not found at {script_path}")
 
-    spec = importlib.util.spec_from_file_location("setup_models", str(script_path))
+    spec = importlib.util.spec_from_file_location("download_weights", str(script_path))
 
     if not spec or not spec.loader:
 
@@ -710,11 +753,13 @@ class _DownloadWorker(QThread):
 
 
 
-    def __init__(self, selected_keys: list[str], parent=None):
+    def __init__(self, selected_keys: list[str], install_root: Path | None = None, parent=None):
 
         super().__init__(parent)
 
         self._selected = selected_keys
+
+        self._install_root = install_root or _data_root()
 
         self._cancelled = False
 
@@ -732,175 +777,155 @@ class _DownloadWorker(QThread):
 
         try:
 
-            setup_models = _load_setup_models()
+            dw = _load_setup_models()
 
-        except Exception as e:
+        except Exception:
 
-            logger.exception("Failed to load setup_models")
+            logger.exception("Failed to load download_weights")
 
             self.all_finished.emit(False)
 
             return
 
-
-
-        self._patch_mlx_progress(setup_models)
-
-
-
-        all_ok = True
-
-        for key in self._selected:
-
-            if self._cancelled:
-
-                break
-
-
-
-            self._current_key = key
-
-            label = next((m["label"] for m in MODELS if m["key"] == key), key)
-
-            self.model_started.emit(key, label)
-
-
-
+        # main.py enables HF_HUB_OFFLINE=1 at module import time; temporarily
+        # allow online Hugging Face downloads during explicit SetupWizard runs.
+        prev_hf_offline = os.environ.pop("HF_HUB_OFFLINE", None)
+        prev_tf_offline = os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        orig_hf_download = None
+        orig_snapshot_download = None
+        orig_dw_hf_download = None
+        orig_dw_snapshot_download = None
+        hf_mod = None
+        try:
             try:
+                import huggingface_hub as hf_mod
+                orig_hf_download = hf_mod.hf_hub_download
+                orig_snapshot_download = getattr(hf_mod, "snapshot_download", None)
+                worker = self
 
-                ok = self._download_one(setup_models, key)
+                def _progress_hf_download(*a, **kw):
+                    res = orig_hf_download(*a, **kw)
+                    if not worker._cancelled:
+                        worker.model_progress.emit(worker._current_key, 100, 100)
+                    return res
 
-            except Exception as e:
+                def _progress_snapshot_download(*a, **kw):
+                    res = orig_snapshot_download(*a, **kw)
+                    if not worker._cancelled:
+                        worker.model_progress.emit(worker._current_key, 100, 100)
+                    return res
 
-                logger.exception("Download failed for %s", key)
+                hf_mod.hf_hub_download = _progress_hf_download
+                if hasattr(dw, "hf_hub_download"):
+                    orig_dw_hf_download = dw.hf_hub_download
+                    dw.hf_hub_download = _progress_hf_download
+                if orig_snapshot_download is not None:
+                    hf_mod.snapshot_download = _progress_snapshot_download
+                    if hasattr(dw, "snapshot_download"):
+                        orig_dw_snapshot_download = dw.snapshot_download
+                        dw.snapshot_download = _progress_snapshot_download
+            except ImportError:
+                hf_mod = None
 
-                ok = False
+            all_ok = True
+
+            for key in self._selected:
+
+                if self._cancelled:
+
+                    break
+
+                self._current_key = key
+
+                label = next((m["label"] for m in MODELS if m["key"] == key), key)
+
+                self.model_started.emit(key, label)
+
+                try:
+
+                    ok = self._download_one(dw, key)
+
+                except Exception:
+
+                    logger.exception("Download failed for %s", key)
+
+                    ok = False
+
+                if self._cancelled:
+
+                    break
+
+                self.model_finished.emit(key, ok, "OK" if ok else "Failed")
+
+                if not ok:
+
+                    all_ok = False
+
+            self.all_finished.emit(all_ok)
+        finally:
+            if hf_mod is not None and orig_hf_download is not None:
+                hf_mod.hf_hub_download = orig_hf_download
+            if hf_mod is not None and orig_snapshot_download is not None:
+                hf_mod.snapshot_download = orig_snapshot_download
+            if orig_dw_hf_download is not None:
+                dw.hf_hub_download = orig_dw_hf_download
+            if orig_dw_snapshot_download is not None:
+                dw.snapshot_download = orig_dw_snapshot_download
+            if prev_hf_offline is not None:
+                os.environ["HF_HUB_OFFLINE"] = prev_hf_offline
+            if prev_tf_offline is not None:
+                os.environ["TRANSFORMERS_OFFLINE"] = prev_tf_offline
 
 
 
-            if self._cancelled:
-
-                break
-
-
-
-            self.model_finished.emit(key, ok, "OK" if ok else "Failed")
-
-            if not ok:
-
-                all_ok = False
-
-
-
-        self.all_finished.emit(all_ok)
-
-
-
-    def _download_one(self, setup_models, key: str) -> bool:
+    def _download_one(self, dw, key: str) -> bool:
+        root = Path(self._install_root)
+        root.mkdir(parents=True, exist_ok=True)
 
         if key == "corridorkey":
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(dw.CORRIDORKEY_REPO, "corridorkey_v2.safetensors", local_dir=root / "weights")
+            hf_hub_download(dw.CORRIDORKEY_REPO, "foundation_stats.safetensors", local_dir=root / "weights")
+            return (
+                (root / "weights" / "corridorkey_v2.safetensors").is_file()
+                and (root / "weights" / "foundation_stats.safetensors").is_file()
+            )
 
-            return setup_models.download_model("corridorkey")
+        elif key == "vfms":
+            dw.download_cradio(root)
+            dw.download_moge(root)
+            dw.download_rvm(root)
+            return (
+                (root / "vfms" / "rvm" / "pretrain_rvm_small16_256_204031069.npz").is_file()
+                and (root / "vfms" / "moge" / "model.pt").is_file()
+                and (root / "vfms" / "cradio" / "C-RADIOv4-SO400M").is_dir()
+            )
 
-        elif key == "corridorkey-blue":
-
-            return setup_models.download_model("corridorkey-blue")
-
-        elif key == "corridorkey-mlx":
-
-            return setup_models.download_corridorkey_mlx()
+        elif key in _BIREFNET_DOWNLOAD_SPECS:
+            from huggingface_hub import snapshot_download
+            _, repo_id, _, _ = _BIREFNET_DOWNLOAD_SPECS[key]
+            hf_dir = _hf_hub_cache_dir()
+            snapshot_download(repo_id, cache_dir=hf_dir)
+            return _hf_cache_has(repo_id, hf_dir)
 
         elif key == "sam3":
-
-            return setup_models.download_sam3_model("base-plus")
-
-        elif key == "gvm":
-
-            return setup_models.download_model("gvm")
-
-        elif key == "matanyone2":
-
-            return setup_models.download_matanyone2()
-
-        elif key == "birefnet":
-
-            return setup_models.download_birefnet()
-
-        elif key == "videomama":
-
-            return setup_models.download_model("videomama")
+            sam_dir = root / "weights" / "sam3"
+            sam_dir.mkdir(parents=True, exist_ok=True)
+            sam_file = sam_dir / "sam3.1-INT8-ConvRot.safetensors"
+            if not sam_file.is_file():
+                from huggingface_hub import hf_hub_download
+                hf_hub_download(
+                    "unsloth/sam3.1",
+                    "sam3.1-INT8-ConvRot.safetensors",
+                    local_dir=sam_dir,
+                )
+            head_file = sam_dir / "sam3.1-tracker-head.safetensors"
+            if not head_file.is_file():
+                from scripts.extract_sam3_tracker_head import extract_sam3_tracker_head
+                extract_sam3_tracker_head(head_file)
+            return sam_file.is_file() and head_file.is_file()
 
         return False
-
-
-
-    def _patch_mlx_progress(self, setup_models):
-
-        worker = self
-
-        original = setup_models.download_corridorkey_mlx
-
-
-
-        def patched():
-
-            # Reuse the canonical per-file downloader (SHA256 verify, tmp
-
-            # rename, disk-space check) and only supply wizard progress.
-
-            def hook(bn, bs, total):
-
-                if total > 0 and not worker._cancelled:
-
-                    worker.model_progress.emit(
-
-                        worker._current_key,
-
-                        (bn * bs) // (1024 * 1024),
-
-                        total // (1024 * 1024),
-
-                    )
-
-
-
-            ok = True
-
-            for cfg in setup_models.MLX_CHECKPOINTS:
-
-                if worker._cancelled:
-
-                    return False
-
-                ok = setup_models._download_mlx_one(cfg, reporthook=hook) and ok
-
-            return ok
-
-
-
-        setup_models.download_corridorkey_mlx = patched
-
-
-
-        try:
-
-            import huggingface_hub
-
-            orig_hf = huggingface_hub.hf_hub_download
-
-            def patched_hf(*a, **kw):
-
-                r = orig_hf(*a, **kw)
-
-                worker.model_progress.emit(worker._current_key, 100, 100)
-
-                return r
-
-            huggingface_hub.hf_hub_download = patched_hf
-
-        except ImportError:
-
-            pass
 
 
 
@@ -1267,6 +1292,7 @@ class SetupWizard(QDialog):
 
 
         browse_btn = QPushButton(self.tr("Browse..."))
+        self._browse_btn = browse_btn
 
         browse_btn.setStyleSheet(
 
@@ -1285,6 +1311,7 @@ class SetupWizard(QDialog):
 
 
         default_btn = QPushButton(self.tr("Default Location"))
+        self._default_btn = default_btn
 
         default_btn.setToolTip(
 
@@ -1527,14 +1554,12 @@ class SetupWizard(QDialog):
         # If opened with preselected keys, check only those and uncheck others
 
         if self._preselected is not None:
-
             for key, row in self._rows.items():
-
-                if row._required:
-
+                if row._required or not row.checkbox.isEnabled():
                     continue
-
                 row.checkbox.setChecked(key in self._preselected)
+            if hasattr(self, "_install_btn") and any(r.is_selected() for r in self._rows.values()):
+                self._install_btn.setText(self.tr("Download && Install"))
 
 
 
@@ -1680,15 +1705,13 @@ class SetupWizard(QDialog):
 
         mark_setup_seen()
 
-        if self._shortcut_check.isChecked():
-
-            self._create_desktop_shortcut()
-
-
-
         selected = [key for key, row in self._rows.items() if row.is_selected()]
 
         if not selected:
+
+            if self._shortcut_check.isChecked():
+
+                self._create_desktop_shortcut()
 
             self.accept()
 
@@ -1701,6 +1724,10 @@ class SetupWizard(QDialog):
         self._install_btn.setEnabled(False)
 
         self._loc_edit.setEnabled(False)
+        if hasattr(self, "_browse_btn"):
+            self._browse_btn.setEnabled(False)
+        if hasattr(self, "_default_btn"):
+            self._default_btn.setEnabled(False)
 
         for row in self._rows.values():
 
@@ -1720,7 +1747,8 @@ class SetupWizard(QDialog):
 
         # Create worker as child of this dialog so it stays alive
 
-        self._worker = _DownloadWorker(selected, parent=self)
+        install_root = Path(install_dir) if install_dir else None
+        self._worker = _DownloadWorker(selected, install_root=install_root, parent=self)
 
         self._worker.model_started.connect(self._on_model_started)
 
@@ -1779,6 +1807,10 @@ class SetupWizard(QDialog):
 
 
         self._downloading = False
+        if hasattr(self, "_browse_btn"):
+            self._browse_btn.setEnabled(True)
+        if hasattr(self, "_default_btn"):
+            self._default_btn.setEnabled(True)
 
 
 
@@ -1874,7 +1906,7 @@ class SetupWizard(QDialog):
 
             elif sys.platform == "win32":
 
-                # Windows: create a .lnk shortcut via PowerShell
+                # Windows: create a .lnk shortcut via PowerShell using env vars (no string injection)
 
                 import subprocess
 
@@ -1885,26 +1917,23 @@ class SetupWizard(QDialog):
                 lnk = desktop / "CorridorKey.lnk"
 
                 ps_cmd = (
-
-                    f'$ws = New-Object -ComObject WScript.Shell; '
-
-                    f'$s = $ws.CreateShortcut("{lnk}"); '
-
-                    f'$s.TargetPath = "{app_exe}"; '
-
-                    f'$s.IconLocation = "{icon},0"; '
-
-                    f'$s.Description = "CorridorKey - AI Green Screen"; '
-
-                    f'$s.Save()'
-
+                    "$ws = New-Object -ComObject WScript.Shell; "
+                    "$s = $ws.CreateShortcut($env:CK_LNK); "
+                    "$s.TargetPath = $env:CK_EXE; "
+                    "$s.IconLocation = \"$($env:CK_ICON),0\"; "
+                    "$s.Description = 'CorridorKey 2.0 - AI Green Screen'; "
+                    "$s.Save()"
                 )
+                env = os.environ.copy()
+                env["CK_LNK"] = str(lnk)
+                env["CK_EXE"] = str(app_exe)
+                env["CK_ICON"] = str(icon)
 
                 subprocess.run(
 
                     ["powershell", "-NoProfile", "-Command", ps_cmd],
 
-                    capture_output=True, timeout=10,
+                    env=env, capture_output=True, timeout=10,
 
                 )
 

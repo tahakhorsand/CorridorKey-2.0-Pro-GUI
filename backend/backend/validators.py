@@ -71,8 +71,7 @@ def normalize_mask_channels(
     if mask.ndim == 3:
         if mask.shape[2] == 0:
             raise MaskChannelError(clip_name, frame_index, 0)
-        # Always extract first channel regardless of channel count
-        mask = mask[:, :, 0]
+        mask = mask[:, :, 3] if mask.shape[2] == 4 else mask[:, :, 0]
     elif mask.ndim != 2:
         raise MaskChannelError(clip_name, frame_index, mask.ndim)
 

@@ -166,6 +166,23 @@ class IOTrayActionsMixin:
         if not os.path.isdir(output_dir):
             output_dir = clip.root_path
 
+        nuke_action = QAction(self.tr("Export Nuke Script (.nk)..."), self)
+        nuke_action.triggered.connect(lambda checked=False, c=clip: self.export_nuke_requested.emit(c))
+        menu.addAction(nuke_action)
+
+        fcpxml_action = QAction(self.tr("Export FCPXML (Premiere / Resolve)..."), self)
+        fcpxml_action.triggered.connect(lambda checked=False, c=clip: self.export_fcpxml_requested.emit(c))
+        menu.addAction(fcpxml_action)
+
+        ae_action = QAction(self.tr("Export After Effects (.jsx)..."), self)
+        ae_action.triggered.connect(lambda checked=False, c=clip: self.export_ae_requested.emit(c))
+        menu.addAction(ae_action)
+
+        fusion_action = QAction(self.tr("Export DaVinci Fusion (.comp)..."), self)
+        fusion_action.triggered.connect(lambda checked=False, c=clip: self.export_fusion_requested.emit(c))
+        menu.addAction(fusion_action)
+        menu.addSeparator()
+
         open_action = QAction(self.tr("Open Containing Folder"), self)
         open_action.triggered.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
@@ -233,7 +250,7 @@ class IOTrayActionsMixin:
             self.extract_requested.emit(needs)
 
     def _clear_mask_batch(self, clips: list[ClipEntry]) -> None:
-        """Delete VideoMamaMaskHint folder from disk for one or more clips."""
+        """Delete SamMaskHint (and any legacy VideoMamaMaskHint) from disk for one or more clips."""
         names = ", ".join(c.name for c in clips[:3])
         if len(clips) > 3:
             names += f" (+{len(clips) - 3} more)"
@@ -247,12 +264,13 @@ class IOTrayActionsMixin:
             return
 
         for clip in clips:
-            mask_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
-            if os.path.isdir(mask_dir):
-                shutil.rmtree(mask_dir, ignore_errors=True)
-            for candidate in glob_module.glob(os.path.join(clip.root_path, "VideoMamaMaskHint.*")):
-                if os.path.isfile(candidate) and is_video_file(candidate):
-                    os.remove(candidate)
+            for dir_name in ("SamMaskHint", "VideoMamaMaskHint"):
+                mask_dir = os.path.join(clip.root_path, dir_name)
+                if os.path.isdir(mask_dir):
+                    shutil.rmtree(mask_dir, ignore_errors=True)
+                for candidate in glob_module.glob(os.path.join(clip.root_path, f"{dir_name}.*")):
+                    if os.path.isfile(candidate) and is_video_file(candidate):
+                        os.remove(candidate)
             clip.mask_asset = None
             clip.find_assets()
             self._model.update_clip_state(clip.name, clip.state)
@@ -313,12 +331,13 @@ class IOTrayActionsMixin:
 
         for clip in clips:
             # Masks
-            mask_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
-            if os.path.isdir(mask_dir):
-                shutil.rmtree(mask_dir, ignore_errors=True)
-            for candidate in glob_module.glob(os.path.join(clip.root_path, "VideoMamaMaskHint.*")):
-                if os.path.isfile(candidate) and is_video_file(candidate):
-                    os.remove(candidate)
+            for dir_name in ("SamMaskHint", "VideoMamaMaskHint"):
+                mask_dir = os.path.join(clip.root_path, dir_name)
+                if os.path.isdir(mask_dir):
+                    shutil.rmtree(mask_dir, ignore_errors=True)
+                for candidate in glob_module.glob(os.path.join(clip.root_path, f"{dir_name}.*")):
+                    if os.path.isfile(candidate) and is_video_file(candidate):
+                        os.remove(candidate)
             clip.mask_asset = None
 
             # Alpha
@@ -396,9 +415,11 @@ class IOTrayActionsMixin:
             for output_dir in self._all_output_dirs(clip):
                 total_cleared += self._clear_output_files(output_dir)
 
-            if clip.state == ClipState.COMPLETE:
-                clip.state = ClipState.READY
-                self._model.update_clip_state(clip.name, ClipState.READY)
+            # Re-scan disk assets so state accurately reflects remaining hints/inputs
+            clip.find_assets()
+            self._model.update_clip_state(
+                clip.name, clip.state, root_path=clip.root_path
+            )
 
         self._model.layoutChanged.emit()
         # Re-select first affected clip so the viewer rebuilds its FrameIndex

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _METADATA_FILENAME = ".video_metadata.json"
 _MIN_FFMPEG_MAJOR = 7
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_BUNDLED_FFMPEG_DIR = os.path.join(_REPO_ROOT, "ffmpeg")
 _LOCAL_FFMPEG_BIN = os.path.join(_REPO_ROOT, "tools", "ffmpeg", "bin")
 
 # Repair installs this exact immutable asset: gyan.dev's static full build
@@ -97,7 +98,7 @@ def set_custom_ffmpeg_dir(path: str) -> None:
 
 def _build_windows_search_paths() -> list[str]:
     """Build an extended list of Windows directories to search for FFmpeg."""
-    paths = [_LOCAL_FFMPEG_BIN]
+    paths = [_BUNDLED_FFMPEG_DIR, _LOCAL_FFMPEG_BIN]
 
     # User-configured custom path (highest priority after bundled)
     custom = _get_custom_ffmpeg_dir()
@@ -469,7 +470,7 @@ def get_ffmpeg_install_help() -> str:
     """Return concise install guidance for the current platform."""
     if sys.platform == "win32":
         return (
-            "Use the CorridorKey Repair FFmpeg action or re-run 1-install.bat.\n"
+            "Use the CorridorKey Repair FFmpeg action or re-run install.bat.\n"
             "CorridorKey will install a full bundled FFmpeg build into tools\\ffmpeg."
         )
     if sys.platform == "darwin":
@@ -632,18 +633,25 @@ def repair_ffmpeg_install(
         if progress_callback:
             progress_callback(phase, current, total)
 
-    tools_dir = os.path.join(_REPO_ROOT, "tools")
+    if getattr(sys, "frozen", False):
+        try:
+            from backend.project import get_data_dir
+            writable_root = get_data_dir()
+        except Exception:
+            writable_root = os.path.dirname(sys.executable)
+    else:
+        writable_root = _REPO_ROOT
+
+    tools_dir = os.path.join(writable_root, "tools")
     dest_dir = os.path.join(tools_dir, "ffmpeg")
-    temp_dir = os.path.join(_REPO_ROOT, ".tmp", "ffmpeg-repair")
+    temp_dir = os.path.join(writable_root, ".tmp", "ffmpeg-repair")
     extract_dir = os.path.join(temp_dir, "extract")
     backup_dir = os.path.join(temp_dir, "ffmpeg-backup")
 
     os.makedirs(temp_dir, exist_ok=True)
     os.makedirs(tools_dir, exist_ok=True)
 
-    # Build an SSL context that works in frozen (PyInstaller) builds where
-    # Python's bundled cert store may be incomplete. Try certifi first,
-    # then the system default, then fall back to unverified as last resort.
+    # Build a verified SSL context (never fall back to CERT_NONE).
     ssl_ctx: ssl.SSLContext | None = None
     try:
         import certifi
@@ -651,80 +659,75 @@ def repair_ffmpeg_install(
     except Exception:
         try:
             ssl_ctx = ssl.create_default_context()
-        except Exception:
-            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-            logger.warning(
-                "SSL certificate verification disabled for FFmpeg download: "
-                "certifi is missing and the system cert store failed."
-            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not initialize a verified TLS certificate store to download FFmpeg. "
+                "Please install certifi or check your system CA certificates."
+            ) from exc
 
     # Resolve the pinned verified build (immutable versioned release asset).
     asset_name, download_url = _resolve_windows_ffmpeg_asset(ssl_ctx)
     zip_path = os.path.join(temp_dir, asset_name)
 
-    _emit("Downloading FFmpeg", 0, 0)
-    with urllib.request.urlopen(
-        download_url, timeout=60, context=ssl_ctx,
-    ) as response:
-        total_header = response.headers.get("Content-Length", "")
-        total_bytes = int(total_header) if total_header.isdigit() else 0
-        downloaded = 0
-        with open(zip_path, "wb") as handle:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                downloaded += len(chunk)
-                _emit("Downloading FFmpeg", downloaded, total_bytes)
-
-    # Extract to a staging dir and validate BEFORE touching the working install,
-    # so a bad download never strands the user without a usable FFmpeg.
-    _emit("Extracting FFmpeg", 0, 0)
-    if os.path.isdir(extract_dir):
-        shutil.rmtree(extract_dir, ignore_errors=True)
-    os.makedirs(extract_dir, exist_ok=True)
-    _safe_extract_zip(zip_path, extract_dir)
-
-    staged_root = _find_staged_ffmpeg_dir(extract_dir)
-    if staged_root is None:
-        raise RuntimeError(
-            "Downloaded FFmpeg archive did not contain ffmpeg.exe and ffprobe.exe."
-        )
-
-    _emit("Validating FFmpeg", 0, 0)
-    _validate_staged_ffmpeg(staged_root)
-
-    # Swap into place with backup + rollback. Move the old install aside first;
-    # only delete it once the new one is validated in its final location.
-    if os.path.isdir(backup_dir):
-        shutil.rmtree(backup_dir, ignore_errors=True)
-    had_previous = os.path.isdir(dest_dir)
-    if had_previous:
-        _robust_move(dest_dir, backup_dir)
     try:
-        # COPY rather than move: the just-validated ffprobe.exe is briefly
-        # locked (antivirus scan / execute handle), and a move would have to
-        # delete that locked source file (WinError 32). Copying only reads the
-        # staged tree, so the lock does not block it. Leftover staging is
-        # cleaned best-effort in the finally below.
-        _robust_copytree(staged_root, dest_dir)
-        result = validate_ffmpeg_install(require_probe=True)
-        if not result.ok:
-            raise RuntimeError(result.message)
-    except Exception:
-        # Roll back to the previous working install.
-        shutil.rmtree(dest_dir, ignore_errors=True)
-        if had_previous and os.path.isdir(backup_dir):
-            _robust_move(backup_dir, dest_dir)
-            logger.warning("Repair FFmpeg failed; restored previous FFmpeg install.")
-        raise
+        _emit("Downloading FFmpeg", 0, 0)
+        with urllib.request.urlopen(
+            download_url, timeout=60, context=ssl_ctx,
+        ) as response:
+            total_header = response.headers.get("Content-Length", "")
+            total_bytes = int(total_header) if total_header.isdigit() else 0
+            downloaded = 0
+            with open(zip_path, "wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    _emit("Downloading FFmpeg", downloaded, total_bytes)
+
+        # Extract to a staging dir and validate BEFORE touching the working install,
+        # so a bad download never strands the user without a usable FFmpeg.
+        _emit("Extracting FFmpeg", 0, 0)
+        if os.path.isdir(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        os.makedirs(extract_dir, exist_ok=True)
+        _safe_extract_zip(zip_path, extract_dir)
+
+        staged_root = _find_staged_ffmpeg_dir(extract_dir)
+        if staged_root is None:
+            raise RuntimeError(
+                "Downloaded FFmpeg archive did not contain ffmpeg.exe and ffprobe.exe."
+            )
+
+        _emit("Validating FFmpeg", 0, 0)
+        _validate_staged_ffmpeg(staged_root)
+
+        # Swap into place with backup + rollback. Move the old install aside first;
+        # only delete it once the new one is validated in its final location.
+        if os.path.isdir(backup_dir):
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        had_previous = os.path.isdir(dest_dir)
+        if had_previous:
+            _robust_move(dest_dir, backup_dir)
+        try:
+            _robust_copytree(staged_root, dest_dir)
+            result = validate_ffmpeg_install(require_probe=True)
+            if not result.ok:
+                raise RuntimeError(result.message)
+        except Exception:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            if had_previous and os.path.isdir(backup_dir):
+                _robust_move(backup_dir, dest_dir)
+                logger.warning("Repair FFmpeg failed; restored previous FFmpeg install.")
+            raise
     finally:
-        # Best-effort staging cleanup. A locked staged .exe here must never
-        # fail the repair: the validated install already lives in dest_dir.
         shutil.rmtree(extract_dir, ignore_errors=True)
+        try:
+            if os.path.isfile(zip_path):
+                os.remove(zip_path)
+        except OSError:
+            pass
 
     # Success: drop the backup.
     shutil.rmtree(backup_dir, ignore_errors=True)

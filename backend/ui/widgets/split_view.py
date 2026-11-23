@@ -54,6 +54,10 @@ class SplitViewWidget(QWidget):
     color_sampled = Signal(int, int, int)  # eyedropper: final averaged RGB on release
     color_preview = Signal(int, int, int)  # eyedropper: live running-average RGB during drag
     screen_samples_ready = Signal(object)  # eyedropper: full list of (r,g,b) samples on release
+    pixel_hovered = Signal(int, int, int, int, int, float)  # x, y, r, g, b, alpha
+    polygon_completed = Signal(str, object)                 # kind ("garbage"|"core"), [(nx, ny), ...]
+    polygon_vertex_moved = Signal(str, int, int, float, float)  # shape_id, frame_idx, vert_idx, nx, ny
+    mask_paint_stroke = Signal(int, str, object, float)     # frame_idx, "add"|"erase", [(x, y), ...], radius
 
     # Divider hit zone (pixels from divider line)
     _DIVIDER_HIT_ZONE = 8
@@ -119,6 +123,13 @@ class SplitViewWidget(QWidget):
         self._mouse_pos: QPointF = QPointF()  # last known mouse position (display)
         self._straight_line: bool = False    # Alt+click straight-line mode
         self._line_anchor: tuple[float, float] | None = None  # anchor in image-pixel coords
+        self._active_object_id: int = 1
+        self._polygon_model = None
+        self._poly_points: list[tuple[float, float]] = []
+        self._dragging_poly_vertex: tuple[str, int, float, float] | None = None
+        self._mask_paint_points: list[tuple[float, float]] = []
+        self._alpha_probe_array = None
+        self._inspect_mode: str = "rgb"
 
         # Holdout mask state (chroma key forced regions)
         self._holdout_model: AnnotationModel | None = None
@@ -177,15 +188,15 @@ class SplitViewWidget(QWidget):
 
     def set_placeholder(self, text: str) -> None:
         self._placeholder = text
+        self._single_image = None
+        self._left_image = None
+        self._right_image = None
+        self.update()
 
     def set_extraction_progress(self, progress: float, total: int) -> None:
         """Update extraction progress overlay. Set total=0 to clear."""
         self._extraction_progress = progress
         self._extraction_total = total
-        self.update()
-        self._single_image = None
-        self._left_image = None
-        self._right_image = None
         self.update()
 
     def reset_zoom(self) -> None:
@@ -245,6 +256,8 @@ class SplitViewWidget(QWidget):
         dest = self._image_rect(displayed)
         iw, ih = source.width(), source.height()
         dw, dh = displayed.width(), displayed.height()
+        if iw <= 0 or ih <= 0 or dw <= 0 or dh <= 0 or dest.width() <= 0 or dest.height() <= 0:
+            return
 
         img_x = (display_pos.x() - dest.x()) * dw / dest.width()
         img_y = (display_pos.y() - dest.y()) * dh / dest.height()
@@ -280,13 +293,49 @@ class SplitViewWidget(QWidget):
     # ── Annotation API ──
 
     def set_annotation_mode(self, mode: str | None) -> None:
-        """Set annotation mode: 'fg', 'bg', or None to disable."""
+        """Set annotation mode: 'fg', 'bg', 'poly_garbage', 'poly_core', 'mask_paint_fg', 'mask_paint_bg', or None."""
+        if mode != self._annotation_mode:
+            self._poly_points.clear()
+            self._mask_paint_points.clear()
+            self._drawing = False
         self._annotation_mode = mode
         if mode:
             self.setCursor(Qt.CrossCursor)
         elif not self._eyedropper_mode:
             self.unsetCursor()
         self.update()
+
+    def set_active_object_id(self, object_id: int) -> None:
+        self._active_object_id = max(1, min(4, int(object_id)))
+        self.update()
+
+    def set_polygon_model(self, model) -> None:
+        self._polygon_model = model
+        self.update()
+
+    def set_alpha_probe_array(self, alpha_arr) -> None:
+        """Optional float32 [H, W] array used by Pixel Inspector for exact alpha readout."""
+        self._alpha_probe_array = alpha_arr
+
+    def set_inspect_mode(self, mode: str) -> None:
+        """Set channel / key inspection overlay ('rgb', 'r', 'g', 'b', 'status', 'rubylith')."""
+        m = (mode or "rgb").strip().lower()
+        if m not in ("rgb", "r", "g", "b", "status", "rubylith"):
+            m = "rgb"
+        if m != self._inspect_mode:
+            self._inspect_mode = m
+            self.update()
+
+    def _transform_display_qimage(self, qimg: QImage | None) -> QImage | None:
+        """Apply viewer-only inspection view and/or Display .cube LUT without touching source files."""
+        if qimg is None or qimg.isNull():
+            return qimg
+        from backend.color_management import get_display_lut_state
+        lut_on, _ = get_display_lut_state()
+        if self._inspect_mode == "rgb" and not lut_on:
+            return qimg
+        from ui.preview.display_transform import apply_inspection_filter
+        return apply_inspection_filter(qimg, self._inspect_mode, self._alpha_probe_array)
 
     def set_annotation_model(self, model: AnnotationModel | None) -> None:
         self._annotation_model = model
@@ -346,6 +395,9 @@ class SplitViewWidget(QWidget):
         if self._active_annotation_model is not None and self._annotation_mode:
             self._paint_annotations(painter)
 
+        # Polygon matte & post-track mask paint overlays
+        self._paint_polygon_and_mask_overlays(painter)
+
         # Extraction progress overlay (replaces placeholder during extraction)
         if self._extraction_total > 0:
             self._paint_extraction_overlay(painter)
@@ -360,7 +412,7 @@ class SplitViewWidget(QWidget):
 
     def _paint_single(self, painter: QPainter) -> None:
         """Draw single image with zoom/pan."""
-        img = self._single_image
+        img = self._transform_display_qimage(self._single_image)
         if img is None:
             return
 
@@ -382,10 +434,11 @@ class SplitViewWidget(QWidget):
 
         # Right side — fit image into right panel
         if self._right_image:
+            right_img = self._transform_display_qimage(self._right_image)
             right_vp = QRectF(divider_x, 0, w - divider_x, h)
-            dest = self._image_rect(self._right_image, viewport=right_vp)
+            dest = self._image_rect(right_img, viewport=right_vp)
             painter.setClipRect(divider_x, 0, w - divider_x, h)
-            painter.drawImage(dest, self._right_image)
+            painter.drawImage(dest, right_img)
 
         # Remove clip for divider drawing
         painter.setClipping(False)
@@ -436,7 +489,7 @@ class SplitViewWidget(QWidget):
             painter,
             self.width(), self.height(),
             self._wipe_angle, self._wipe_offset,
-            self._left_image, self._right_image,
+            self._left_image, self._transform_display_qimage(self._right_image),
             self._image_rect,
             self._DIVIDER_WIDTH,
         )
@@ -570,6 +623,13 @@ class SplitViewWidget(QWidget):
 
         if self._holdout_active:
             hud_label = "Holdout mask"
+        elif curr_mode == "poly_garbage":
+            hud_label = "Polygon Garbage Matte (Click vertices, Double-click/Enter to close, Right-click undo)"
+        elif curr_mode == "poly_core":
+            hud_label = "Polygon Core Matte (Click vertices, Double-click/Enter to close, Right-click undo)"
+        elif curr_mode in ("mask_paint_fg", "mask_paint_bg"):
+            action_word = "Erase -" if (curr_mode == "mask_paint_bg" or is_alt) else "Paint +"
+            hud_label = f"Post-Track Mask Fix [{action_word}] (Edits saved mask directly, Shift+drag resize)"
         elif curr_mode == "eraser":
             hud_label = "SAM 3.1 Eraser [E] (Click/drag to delete points & strokes | Right-click anytime)"
         elif curr_mode == "hair":
@@ -596,18 +656,165 @@ class SplitViewWidget(QWidget):
         )
 
         # Brush cursor at mouse position
-        if self._annotation_mode and self.underMouse() and paintable_rect.contains(self._mouse_pos):
+        if (
+            self._annotation_mode
+            and self._annotation_mode not in ("poly_garbage", "poly_core")
+            and self.underMouse()
+            and paintable_rect.contains(self._mouse_pos)
+        ):
             radius_display = self._brush_radius * dest.width() / iw
+            cursor_brush = (
+                "fg"
+                if eff_brush == "mask_paint_fg"
+                else ("bg" if eff_brush == "mask_paint_bg" else eff_brush)
+            )
             if self._resizing_brush:
                 paint_resize_indicator(
                     painter, self._mouse_pos, radius_display,
-                    self._brush_radius, eff_brush,
+                    self._brush_radius, cursor_brush,
                 )
             else:
                 paint_brush_cursor(
                     painter, self._mouse_pos, radius_display,
-                    eff_brush,
+                    cursor_brush,
                 )
+
+    def _finish_polygon(self) -> None:
+        if len(self._poly_points) >= 3 and self._annotation_mode in ("poly_garbage", "poly_core"):
+            kind = "core" if self._annotation_mode == "poly_core" else "garbage"
+            pts = list(self._poly_points)
+            self._poly_points.clear()
+            self.polygon_completed.emit(kind, pts)
+            self.update()
+        else:
+            self._poly_points.clear()
+            self.update()
+
+    def _paint_polygon_and_mask_overlays(self, painter: QPainter) -> None:
+        img = self._annotation_target_image()
+        if img is None or img.width() <= 0 or img.height() <= 0:
+            return
+        dest = self._image_rect(img, viewport=self._annotation_viewport())
+        iw, ih = img.width(), img.height()
+
+        has_shapes = bool(self._polygon_model and getattr(self._polygon_model, "shapes", None))
+        is_poly_mode = self._annotation_mode in ("poly_garbage", "poly_core")
+        has_mask_paint = bool(self._mask_paint_points)
+        if not has_shapes and not is_poly_mode and not has_mask_paint:
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        paintable = self._annotation_paint_rect(img)
+        if paintable is not None:
+            painter.setClipRect(paintable)
+
+        if has_shapes:
+            frame_idx = max(0, int(self._annotation_stem_idx))
+            for shape in self._polygon_model.shapes:
+                if not getattr(shape, "enabled", True):
+                    continue
+                pts = shape.points_at(frame_idx)
+                if len(pts) < 3:
+                    continue
+                col = QColor(0, 220, 140, 210) if shape.kind == "core" else QColor(255, 165, 0, 210)
+                fill = QColor(0, 220, 140, 28) if shape.kind == "core" else QColor(255, 165, 0, 28)
+                pen = QPen(col, 1.8 if is_poly_mode else 1.2, Qt.DashLine)
+                painter.setPen(pen)
+                painter.setBrush(fill if is_poly_mode else Qt.NoBrush)
+                from PySide6.QtGui import QPolygonF
+                qpoly = QPolygonF([
+                    QPointF(
+                        dest.x() + (x * (iw - 1) / iw) * dest.width(),
+                        dest.y() + (y * (ih - 1) / ih) * dest.height(),
+                    )
+                    for x, y in pts
+                ])
+                painter.drawPolygon(qpoly)
+                if is_poly_mode:
+                    ctrl_pts = shape.raw_points_at(frame_idx)
+                    painter.setBrush(col)
+                    for x, y in ctrl_pts:
+                        qp = QPointF(
+                            dest.x() + (x * (iw - 1) / iw) * dest.width(),
+                            dest.y() + (y * (ih - 1) / ih) * dest.height(),
+                        )
+                        painter.drawEllipse(qp, 4.0, 4.0)
+
+        if self._poly_points:
+            col = QColor(0, 240, 180, 240) if self._annotation_mode == "poly_core" else QColor(255, 190, 20, 240)
+            painter.setPen(QPen(col, 2.0, Qt.SolidLine))
+            dpts = [
+                QPointF(
+                    dest.x() + (x * (iw - 1) / iw) * dest.width(),
+                    dest.y() + (y * (ih - 1) / ih) * dest.height(),
+                )
+                for x, y in self._poly_points
+            ]
+            for i in range(len(dpts) - 1):
+                painter.drawLine(dpts[i], dpts[i + 1])
+            if paintable is not None and paintable.contains(self._mouse_pos):
+                painter.setPen(QPen(col, 1.2, Qt.DashLine))
+                painter.drawLine(dpts[-1], self._mouse_pos)
+            painter.setBrush(col)
+            for idx, dp in enumerate(dpts):
+                r = 5.0 if idx == 0 else 3.5
+                painter.drawEllipse(dp, r, r)
+
+        if self._mask_paint_points:
+            is_erase = (
+                self._annotation_mode == "mask_paint_bg"
+                or bool(QApplication.keyboardModifiers() & Qt.AltModifier)
+            )
+            col = QColor(230, 55, 55, 160) if is_erase else QColor(50, 220, 120, 160)
+            disp_r = max(1.0, self._brush_radius * dest.width() / iw)
+            pen = QPen(col, disp_r * 2)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            dpts = [
+                QPointF(
+                    dest.x() + (px / iw) * dest.width(),
+                    dest.y() + (py / ih) * dest.height(),
+                )
+                for px, py in self._mask_paint_points
+            ]
+            if len(dpts) == 1:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(col)
+                painter.drawEllipse(dpts[0], disp_r, disp_r)
+            else:
+                for i in range(len(dpts) - 1):
+                    painter.drawLine(dpts[i], dpts[i + 1])
+
+        painter.restore()
+
+    def _emit_pixel_hover(self, display_pos: QPointF) -> None:
+        img = None
+        dest = None
+        if self._split_enabled:
+            divider_x = self.width() * self._divider_pos
+            if display_pos.x() < divider_x and self._left_image is not None:
+                img = self._left_image
+                dest = self._image_rect(img, viewport=QRectF(0, 0, divider_x, float(self.height())))
+            elif self._right_image is not None:
+                img = self._right_image
+                dest = self._image_rect(img, viewport=QRectF(divider_x, 0, float(self.width()) - divider_x, float(self.height())))
+        else:
+            img = self._single_image or self._right_image or self._left_image
+            if img is not None:
+                dest = self._image_rect(img)
+        if img is None or dest is None or img.width() <= 0 or img.height() <= 0 or not dest.contains(display_pos):
+            return
+        ix = max(0, min(img.width() - 1, int((display_pos.x() - dest.x()) * img.width() / max(1.0, dest.width()))))
+        iy = max(0, min(img.height() - 1, int((display_pos.y() - dest.y()) * img.height() / max(1.0, dest.height()))))
+        px_col = img.pixelColor(ix, iy)
+        alpha_val = px_col.alphaF()
+        arr = self._alpha_probe_array
+        if arr is not None and iy < arr.shape[0] and ix < arr.shape[1]:
+            raw = arr[iy, ix] if arr.ndim == 2 else arr[iy, ix, 0]
+            alpha_val = float(raw) / 255.0 if arr.dtype.kind in ("u", "i") else float(raw)
+        self.pixel_hovered.emit(ix, iy, px_col.red(), px_col.green(), px_col.blue(), max(0.0, min(1.0, float(alpha_val))))
 
     def _display_to_image(self, display_pos: QPointF) -> tuple[float, float] | None:
         """Convert display coordinates to image-pixel coordinates.
@@ -666,6 +873,9 @@ class SplitViewWidget(QWidget):
         else:
             vx, vy = 0.0, 0.0
             vw, vh = self.width(), self.height()
+
+        if iw <= 0 or ih <= 0 or vw <= 0 or vh <= 0:
+            return QRectF(vx, vy, max(1.0, vw), max(1.0, vh))
 
         # Fit to viewport at zoom=1.0
         scale_fit = min(vw / iw, vh / ih)
@@ -729,6 +939,51 @@ class SplitViewWidget(QWidget):
             return
 
 
+        # Polygon matte authoring clicks
+        if self._annotation_mode in ("poly_garbage", "poly_core"):
+            if event.button() == Qt.RightButton:
+                if self._poly_points:
+                    self._poly_points.pop()
+                    self.update()
+                return
+            if event.button() == Qt.LeftButton:
+                img = self._annotation_target_image()
+                pos = self._display_to_image(event.position())
+                if img is not None and pos is not None and img.width() > 1 and img.height() > 1:
+                    iw, ih = float(img.width() - 1), float(img.height() - 1)
+                    nx, ny = pos[0] / iw, pos[1] / ih
+                    dest = self._image_rect(img, viewport=self._annotation_viewport())
+                    if not self._poly_points and self._polygon_model is not None:
+                        fidx = max(0, int(self._annotation_stem_idx))
+                        for shape in self._polygon_model.shapes:
+                            if not getattr(shape, "enabled", True):
+                                continue
+                            for v_idx, (vx, vy) in enumerate(shape.raw_points_at(fidx)):
+                                sx = dest.x() + (vx * iw / img.width()) * dest.width()
+                                sy = dest.y() + (vy * ih / img.height()) * dest.height()
+                                if ((event.position().x() - sx) ** 2 + (event.position().y() - sy) ** 2) ** 0.5 < 10.0:
+                                    self._dragging_poly_vertex = (shape.shape_id, v_idx, vx, vy)
+                                    self.update()
+                                    return
+                    if len(self._poly_points) >= 3:
+                        sx = dest.x() + (self._poly_points[0][0] * iw / img.width()) * dest.width()
+                        sy = dest.y() + (self._poly_points[0][1] * ih / img.height()) * dest.height()
+                        if ((event.position().x() - sx) ** 2 + (event.position().y() - sy) ** 2) ** 0.5 < 12.0:
+                            self._finish_polygon()
+                            return
+                    self._poly_points.append((nx, ny))
+                    self.update()
+                return
+
+        # Direct Post-Track Mask Paint clicks (paints onto saved SamMaskHint/AlphaHint, not SAM strokes)
+        if self._annotation_mode in ("mask_paint_fg", "mask_paint_bg") and event.button() == Qt.LeftButton:
+            pos = self._display_to_image(event.position())
+            if pos is not None:
+                self._drawing = True
+                self._mask_paint_points = [pos]
+                self.update()
+            return
+
         # Annotation: right-click = erase stroke/point under cursor
         if (event.button() == Qt.RightButton
                 and self._annotation_mode
@@ -787,6 +1042,7 @@ class SplitViewWidget(QWidget):
                     pos[0], pos[1],
                     eff_type,
                     self._brush_radius,
+                    object_id=self._active_object_id,
                 )
                 self.update()
                 return
@@ -823,6 +1079,36 @@ class SplitViewWidget(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         self._mouse_pos = event.position()
+        self._emit_pixel_hover(self._mouse_pos)
+
+        if self._drawing and self._annotation_mode in ("mask_paint_fg", "mask_paint_bg"):
+            pos = self._display_to_image(event.position())
+            if pos is not None:
+                self._mask_paint_points.append(pos)
+                self.update()
+            return
+
+        if self._dragging_poly_vertex is not None and self._polygon_model is not None:
+            img = self._annotation_target_image()
+            pos = self._display_to_image(event.position())
+            if img is not None and pos is not None and img.width() > 1 and img.height() > 1:
+                nx = pos[0] / float(img.width() - 1)
+                ny = pos[1] / float(img.height() - 1)
+                sid, v_idx, _, _ = self._dragging_poly_vertex
+                fidx = max(0, int(self._annotation_stem_idx))
+                for shape in self._polygon_model.shapes:
+                    if shape.shape_id == sid:
+                        shape.move_vertex(fidx, v_idx, nx, ny)
+                        self._dragging_poly_vertex = (sid, v_idx, nx, ny)
+                        break
+                self.update()
+                if self._annotation_sibling is not None:
+                    self._annotation_sibling.update()
+            return
+
+        if self._annotation_mode in ("poly_garbage", "poly_core"):
+            self.update()
+            return
 
         # Eyedropper: accumulate samples while dragging
         if self._eyedropper_sampling:
@@ -861,9 +1147,10 @@ class SplitViewWidget(QWidget):
                 self.unsetCursor()
 
         if self._dragging_divider:
-            self._divider_pos = max(0.05, min(0.95,
-                event.position().x() / self.width()))
-            self.update()
+            w = self.width()
+            if w > 0:
+                self._divider_pos = max(0.05, min(0.95, event.position().x() / w))
+                self.update()
             return
 
         # Annotation: brush resize (Shift+drag)
@@ -903,10 +1190,16 @@ class SplitViewWidget(QWidget):
         if self._drawing and self._annotation_mode == "point":
             return
 
-        # Annotation: freehand drawing stroke
-        if self._drawing and self._annotation_mode == "eraser":
-            self._drawing = False
-            self.update()
+        # Annotation: box mode updates only the two corner endpoints
+        if self._drawing and self._annotation_mode == "box" and self._active_annotation_model is not None:
+            pos = self._display_to_image(event.position())
+            if pos is not None:
+                stroke = self._active_annotation_model.current_stroke
+                if stroke is not None and stroke.points:
+                    stroke.points = [stroke.points[0], pos]
+                    self.update()
+                    if self._annotation_sibling is not None:
+                        self._annotation_sibling.update()
             return
 
         if self._drawing and self._active_annotation_model is not None:
@@ -980,6 +1273,33 @@ class SplitViewWidget(QWidget):
             self.update()
             return
 
+        if self._dragging_poly_vertex is not None:
+            sid, v_idx, nx, ny = self._dragging_poly_vertex
+            self._dragging_poly_vertex = None
+            fidx = max(0, int(self._annotation_stem_idx))
+            self.polygon_vertex_moved.emit(sid, fidx, v_idx, nx, ny)
+            self.update()
+            return
+
+        if self._drawing and self._annotation_mode in ("mask_paint_fg", "mask_paint_bg"):
+            self._drawing = False
+            pts = list(self._mask_paint_points)
+            self._mask_paint_points.clear()
+            is_erase = (
+                self._annotation_mode == "mask_paint_bg"
+                or bool(event.modifiers() & Qt.AltModifier)
+            )
+            action = "erase" if is_erase else "add"
+            if pts:
+                self.mask_paint_stroke.emit(
+                    int(self._annotation_stem_idx),
+                    action,
+                    pts,
+                    float(self._brush_radius),
+                )
+            self.update()
+            return
+
         if self._drawing and self._active_annotation_model is not None:
             # Straight-line: finalize with anchor + release point
             if self._straight_line and self._line_anchor is not None:
@@ -1001,14 +1321,23 @@ class SplitViewWidget(QWidget):
         if self._panning:
             self._panning = False
             self._pan_pressed = False
-            self.unsetCursor()
+            if self._annotation_mode:
+                self.setCursor(Qt.CrossCursor)
+            elif self._eyedropper_mode:
+                self.setCursor(_eyedropper_cursor())
+            else:
+                self.unsetCursor()
             return
 
         self._pan_pressed = False
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        """Double-click to reset zoom/pan (disabled during annotation)."""
+        """Double-click to close polygon or reset zoom/pan (disabled during brush annotation)."""
+        if event.button() == Qt.LeftButton and self._annotation_mode in ("poly_garbage", "poly_core"):
+            if len(self._poly_points) >= 3:
+                self._finish_polygon()
+            return
         if event.button() == Qt.LeftButton and not self._annotation_mode:
             if self._pan_did_drag:
                 # The preceding click was a left-drag pan; a quick follow-up
@@ -1084,6 +1413,13 @@ class SplitViewWidget(QWidget):
             self.update()
         elif key == Qt.Key_0:
             self.reset_zoom()
+        elif key in (Qt.Key_Return, Qt.Key_Enter) and self._annotation_mode in ("poly_garbage", "poly_core"):
+            if len(self._poly_points) >= 3:
+                self._finish_polygon()
+        elif key == Qt.Key_Escape and self._annotation_mode in ("poly_garbage", "poly_core"):
+            if self._poly_points:
+                self._poly_points.clear()
+                self.update()
         else:
             super().keyPressEvent(event)
 

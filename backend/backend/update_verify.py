@@ -17,7 +17,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # GitHub repository this build updates from.
-UPDATE_ORIGIN = "edenaion/EZ-CorridorKey"
+UPDATE_ORIGIN = "tahakhorsand/CorridorKey-2.0-Pro-GUI"
 
 # Paste the contents of ezck_signing_public.pem here after running
 # scripts/generate_signing_key.py. This key ships with every installed
@@ -79,7 +79,11 @@ def verify_file(path: Path, expected_sha256: str) -> None:
 
     Raises UpdateVerificationError on mismatch.
     """
-    actual = hashlib.sha256(path.read_bytes()).hexdigest().lower()
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest().lower()
     expected = expected_sha256.lower()
     if actual != expected:
         raise UpdateVerificationError(

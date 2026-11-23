@@ -77,7 +77,7 @@ class AutoPipelinesMixin:
                     clip.input_asset,
                     [target_file],
                     clip.name,
-                    gamma_correct_exr=False,
+                    gamma_correct_exr=bool(getattr(clip, "input_is_linear", False)),
                     job=job,
                     on_status=None,
                 )
@@ -120,6 +120,7 @@ class AutoPipelinesMixin:
                     clip.input_asset,
                     selected_input_names,
                     clip.name,
+                    gamma_correct_exr=bool(getattr(clip, "input_is_linear", False)),
                     job=job,
                     on_status=None,
                 )
@@ -129,16 +130,20 @@ class AutoPipelinesMixin:
                 raise JobCancelledError(clip.name, 0)
 
             alpha_dir = os.path.join(clip.root_path, "AlphaHint")
-            frames_written = processor.process_frames(
-                input_frames=frame_iter,
-                output_dir=alpha_dir,
-                frame_names=frame_stems,
-                progress_callback=on_progress,
-                on_status=on_status,
-                cancel_check=_check_cancel,
-                clip_name=clip.name,
-                num_frames=num_frames,
-            )
+            with self._gpu_lock:
+                frames_written = processor.process_frames(
+                    input_frames=frame_iter,
+                    output_dir=alpha_dir,
+                    frame_names=frame_stems,
+                    progress_callback=on_progress,
+                    on_status=on_status,
+                    cancel_check=_check_cancel,
+                    clip_name=clip.name,
+                    num_frames=num_frames,
+                )
+
+            if _check_cancel():
+                raise JobCancelledError(clip.name, frames_written)
 
             # Preserve in dedicated BiRefNetHint directory so tracking SAM does not overwrite BiRefNet
             birefnet_dir = os.path.join(clip.root_path, "BiRefNetHint")
@@ -205,6 +210,7 @@ class AutoPipelinesMixin:
         input_dir = clip.input_asset.path
         ck_params = {
             "screen_color": chroma_params.get("screen_color"),
+            "screen_samples": chroma_params.get("screen_samples"),
             "screen_type": chroma_params.get("screen_type", "green"),
             "strength": chroma_params.get("strength", 1.0),
             "clip_black": chroma_params.get("clip_black", 0.0),
@@ -212,12 +218,16 @@ class AutoPipelinesMixin:
             "shrink_grow": chroma_params.get("shrink_grow", 0),
             "edge_blur": chroma_params.get("edge_blur", 0),
         }
+        is_linear_input = bool(
+            chroma_params.get("input_is_linear", getattr(clip, "input_is_linear", False))
+        )
 
         from ui.widgets.annotation_overlay import AnnotationModel
+        from corridorkey import color_utils as _cu
         _holdout_model = AnnotationModel(filename="holdout_strokes.json")
         _holdout_model.load(clip.root_path)
-        _holdout_needs_raster = _holdout_model.has_annotations(0)
-        _holdout_mask = None
+        _holdout_cache: dict[int, _np.ndarray | None] = {}
+        _start_idx = clip.in_out_range.in_point if clip.in_out_range is not None else 0
 
         def _read_frame(fname: str) -> tuple[str, _np.ndarray | None]:
             fpath = os.path.join(input_dir, fname)
@@ -229,9 +239,19 @@ class AutoPipelinesMixin:
             if bgr is None:
                 logger.warning(f"Chroma key: could not read {fpath}, skipping")
                 return fname, None
-            rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
+            if bgr.ndim == 2:
+                rgb = _np.stack([bgr, bgr, bgr], axis=-1)
+            elif bgr.shape[2] == 4:
+                rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGRA2RGB)
+            else:
+                rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
             if rgb.dtype != _np.uint8:
-                rgb = (_np.clip(rgb, 0.0, 1.0) * 255.0).astype(_np.uint8)
+                rgb_f = rgb.astype(_np.float32)
+                if rgb.dtype == _np.uint16:
+                    rgb_f = rgb_f / 65535.0
+                if is_exr and is_linear_input:
+                    rgb_f = _cu.linear_to_srgb(_np.maximum(rgb_f, 0.0))
+                rgb = (_np.clip(rgb_f, 0.0, 1.0) * 255.0).astype(_np.uint8)
             return fname, rgb
 
         def _write_matte(out_path: str, matte: _np.ndarray) -> None:
@@ -265,14 +285,18 @@ class AutoPipelinesMixin:
                 if frame_rgb is None:
                     continue
 
-                if _holdout_needs_raster and _holdout_mask is None:
-                    h, w = frame_rgb.shape[:2]
-                    _holdout_mask = AnnotationModel.rasterize_holdout_mask(
-                        _holdout_model.get_strokes(0), w, h
-                    )
-                    _holdout_needs_raster = False
+                abs_idx = _start_idx + i
+                stroke_key = abs_idx if _holdout_model.has_annotations(abs_idx) else (0 if _holdout_model.has_annotations(0) else None)
+                holdout_mask = None
+                if stroke_key is not None:
+                    if stroke_key not in _holdout_cache:
+                        h, w = frame_rgb.shape[:2]
+                        _holdout_cache[stroke_key] = AnnotationModel.rasterize_holdout_mask(
+                            _holdout_model.get_strokes(stroke_key), w, h
+                        )
+                    holdout_mask = _holdout_cache[stroke_key]
 
-                matte = chroma_key_matte(frame_rgb, holdout_mask=_holdout_mask, **ck_params)
+                matte = chroma_key_matte(frame_rgb, holdout_mask=holdout_mask, **ck_params)
 
                 stem = os.path.splitext(fname)[0]
                 out_path = os.path.join(alpha_dir, f"{stem}.png")

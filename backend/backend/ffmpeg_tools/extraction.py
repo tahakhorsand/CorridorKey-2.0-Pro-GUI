@@ -224,27 +224,33 @@ def _recompress_one_exr(args: tuple) -> bool:
         if img.ndim == 2:
             hdr['channels'] = {'Y': HALF}
             out = OpenEXR.OutputFile(tmp, hdr)
-            out.writePixels({'Y': img.astype(np.float16).tobytes()})
-            out.close()
+            try:
+                out.writePixels({'Y': img.astype(np.float16).tobytes()})
+            finally:
+                out.close()
         elif img.ndim == 3 and img.shape[2] == 3:
             hdr['channels'] = {'R': HALF, 'G': HALF, 'B': HALF}
             out = OpenEXR.OutputFile(tmp, hdr)
-            out.writePixels({
-                'R': img[:, :, 2].astype(np.float16).tobytes(),
-                'G': img[:, :, 1].astype(np.float16).tobytes(),
-                'B': img[:, :, 0].astype(np.float16).tobytes(),
-            })
-            out.close()
+            try:
+                out.writePixels({
+                    'R': img[:, :, 2].astype(np.float16).tobytes(),
+                    'G': img[:, :, 1].astype(np.float16).tobytes(),
+                    'B': img[:, :, 0].astype(np.float16).tobytes(),
+                })
+            finally:
+                out.close()
         elif img.ndim == 3 and img.shape[2] == 4:
             hdr['channels'] = {'R': HALF, 'G': HALF, 'B': HALF, 'A': HALF}
             out = OpenEXR.OutputFile(tmp, hdr)
-            out.writePixels({
-                'R': img[:, :, 2].astype(np.float16).tobytes(),
-                'G': img[:, :, 1].astype(np.float16).tobytes(),
-                'B': img[:, :, 0].astype(np.float16).tobytes(),
-                'A': img[:, :, 3].astype(np.float16).tobytes(),
-            })
-            out.close()
+            try:
+                out.writePixels({
+                    'R': img[:, :, 2].astype(np.float16).tobytes(),
+                    'G': img[:, :, 1].astype(np.float16).tobytes(),
+                    'B': img[:, :, 0].astype(np.float16).tobytes(),
+                    'A': img[:, :, 3].astype(np.float16).tobytes(),
+                })
+            finally:
+                out.close()
         else:
             return False
         os.replace(tmp, src)
@@ -406,27 +412,33 @@ def recompress_one(args):
         if img.ndim == 2:
             hdr['channels'] = {'Y': HALF}
             out = OpenEXR.OutputFile(tmp, hdr)
-            out.writePixels({'Y': img.astype(np.float16).tobytes()})
-            out.close()
+            try:
+                out.writePixels({'Y': img.astype(np.float16).tobytes()})
+            finally:
+                out.close()
         elif img.ndim == 3 and img.shape[2] == 3:
             hdr['channels'] = {'R': HALF, 'G': HALF, 'B': HALF}
             out = OpenEXR.OutputFile(tmp, hdr)
-            out.writePixels({
-                'R': img[:,:,2].astype(np.float16).tobytes(),
-                'G': img[:,:,1].astype(np.float16).tobytes(),
-                'B': img[:,:,0].astype(np.float16).tobytes(),
-            })
-            out.close()
+            try:
+                out.writePixels({
+                    'R': img[:,:,2].astype(np.float16).tobytes(),
+                    'G': img[:,:,1].astype(np.float16).tobytes(),
+                    'B': img[:,:,0].astype(np.float16).tobytes(),
+                })
+            finally:
+                out.close()
         elif img.ndim == 3 and img.shape[2] == 4:
             hdr['channels'] = {'R': HALF, 'G': HALF, 'B': HALF, 'A': HALF}
             out = OpenEXR.OutputFile(tmp, hdr)
-            out.writePixels({
-                'R': img[:,:,2].astype(np.float16).tobytes(),
-                'G': img[:,:,1].astype(np.float16).tobytes(),
-                'B': img[:,:,0].astype(np.float16).tobytes(),
-                'A': img[:,:,3].astype(np.float16).tobytes(),
-            })
-            out.close()
+            try:
+                out.writePixels({
+                    'R': img[:,:,2].astype(np.float16).tobytes(),
+                    'G': img[:,:,1].astype(np.float16).tobytes(),
+                    'B': img[:,:,0].astype(np.float16).tobytes(),
+                    'A': img[:,:,3].astype(np.float16).tobytes(),
+                })
+            finally:
+                out.close()
         else:
             return False
         os.replace(tmp, src)
@@ -479,14 +491,27 @@ if __name__ == "__main__":
 
     import queue as _queue
     line_q: _queue.Queue[str | None] = _queue.Queue()
+    stderr_chunks: list[str] = []
 
     def _reader():
         for ln in proc.stdout:
             line_q.put(ln.strip())
         line_q.put(None)
 
+    def _stderr_reader():
+        if proc.stderr is not None:
+            try:
+                for ln in proc.stderr:
+                    stderr_chunks.append(ln)
+                    if len(stderr_chunks) > 200:
+                        stderr_chunks.pop(0)
+            except Exception:
+                pass
+
     reader_thread = threading.Thread(target=_reader, daemon=True)
+    stderr_thread = threading.Thread(target=_stderr_reader, daemon=True)
     reader_thread.start()
+    stderr_thread.start()
 
     failed: list[str] = []
     try:
@@ -522,13 +547,14 @@ if __name__ == "__main__":
                 break
 
         proc.wait(timeout=60)
+        stderr_thread.join(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
         logger.error("DWAB recompression subprocess timed out")
-        # The pass did not complete, so no frame is verified — report every
-        # frame as suspect so extract_frames runs the safe-mode retry
-        # (which re-validates with the pool-free sequential pass) instead of
-        # treating a crashed recompress as clean.
         return list(exr_files)
     finally:
         try:
@@ -537,7 +563,7 @@ if __name__ == "__main__":
             pass
 
     if proc.returncode != 0:
-        stderr_out = proc.stderr.read() if proc.stderr else ""
+        stderr_out = "".join(stderr_chunks)
         # Log the TAIL of stderr — the actual exception sits at the bottom
         # of a Python traceback, a head-slice hides it.
         logger.error(f"DWAB recompression failed (code {proc.returncode}): "
@@ -653,23 +679,23 @@ def extract_frames(
                    extra_out_args: list[str] | None = None) -> list[str]:
         out_args = extra_out_args or []
         if start_frame > 0 and total_frames > 0:
-            if video_info is None:
-                _vi = probe_video(video_path)
-            else:
-                _vi = video_info
-            fps = _vi.get("fps", 24.0)
+            _vi = video_info
+            if _vi is None:
+                try:
+                    _vi = probe_video(video_path)
+                except Exception:
+                    _vi = {}
+            fps = float(_vi.get("fps", 24.0) or 24.0)
+            if fps <= 0.0:
+                fps = 24.0
             seek_sec = start_frame / fps
+            # Place -ss after -i for frame-accurate seeking on resume
             return [
                 ffmpeg,
                 *hw_flags,
-                "-ss", f"{seek_sec:.4f}",
                 "-i", video_path,
+                "-ss", f"{seek_sec:.6f}",
                 "-start_number", str(start_frame),
-                # -fps_mode:v passthrough replaces the legacy -vsync passthrough.
-                # -vsync was deprecated in 2023 and is removed in current FFmpeg
-                # git-master builds, which made imports fail with
-                # "Unrecognized option 'vsync'". -fps_mode exists since FFmpeg 5.1
-                # and our minimum is FFmpeg 7, so it is always available.
                 "-fps_mode:v", "passthrough",
                 *exr_args,
                 *out_args,
@@ -757,6 +783,10 @@ def extract_frames(
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
             raise RuntimeError("FFmpeg extraction timed out")
 
         if proc.returncode != 0:

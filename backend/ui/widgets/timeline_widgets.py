@@ -1,718 +1,748 @@
-"""Timeline helper widgets: slider, coverage bar, and marker overlay.
+"""Professional NLE studio timeline canvas for CorridorKey 2.0.
 
-
-
-Extracted from frame_scrubber.py to reduce file size.
-
-These are self-contained QWidget subclasses used by FrameScrubber.
-
-
-
-CoverageBar: multi-lane bar showing alpha, inference, and annotation coverage.
-
-MarkerOverlay: transparent overlay for in/out bracket markers with drag handles.
-
-_FatSlider: QSlider with enlarged clickable groove area.
-
+Replaces the legacy stacked QSlider + transparent MarkerOverlay + CoverageBar
+with a single unified custom-painted DaVinci Resolve / Nuke style timeline widget.
+Provides conflict-free hit-testing (top cap prioritizes playhead, track band
+gives clean priority to prominent In/Out bracket handles, Shift/middle drag
+slides the whole trim range), adaptive frame/timecode ticks, hover preview pill,
+and an integrated 3-lane coverage strip (Alpha, Inference, Annotations).
 """
-
 from __future__ import annotations
 
+from enum import Enum, auto
+from typing import Sequence
+
+from PySide6.QtCore import Qt, Signal, QPoint, QPointF, QRect, QRectF
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPolygonF,
+)
+from PySide6.QtWidgets import QMenu, QSlider, QWidget
 
 
-from PySide6.QtWidgets import QSlider, QWidget, QStyle, QStyleOptionSlider
-
-from PySide6.QtCore import Qt, Signal, QPointF
-
-from PySide6.QtGui import QPainter, QColor, QPolygonF
-
-
-
+class _DragMode(Enum):
+    NONE = auto()
+    SCRUB = auto()
+    IN_HANDLE = auto()
+    OUT_HANDLE = auto()
+    RANGE_SHIFT = auto()
 
 
-class _FatSlider(QSlider):
-    """QSlider with an enlarged clickable groove area and butter-smooth dragging.
+def _format_timecode(frame: int, fps: float) -> str:
+    """Format a 0-based frame index as HH:MM:SS:FF at `fps`."""
+    safe_fps = max(1, int(round(fps if fps > 0 else 24.0)))
+    f = max(0, int(frame))
+    ff = f % safe_fps
+    total_sec = f // safe_fps
+    ss = total_sec % 60
+    total_min = total_sec // 60
+    mm = total_min % 60
+    hh = total_min // 60
+    return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
 
-    Overrides the style sub-control rect so the groove (and its click target)
-    extends to fill the full widget height. Implements mouse capture and tracking
-    so dragging the handle or anywhere along the timeline scrub is instantaneous.
-    """
 
-    def __init__(self, orientation, parent=None):
-        super().__init__(orientation, parent)
-        self.setFixedHeight(22)  # taller than default ~16px
-        self._dragging = False
+class StudioTimelineCanvas(QWidget):
+    """Unified NLE-grade custom-painted timeline scrubber, trim bar, and coverage strip."""
 
-    def _groove_rect(self):
-        """Return the expanded groove rect used for hit-testing."""
-        opt = QStyleOptionSlider()
-        self.initStyleOption(opt)
-        base = self.style().subControlRect(
-            QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self
-        )
-        base.setTop(0)
-        base.setBottom(self.height())
-        return base
+    frame_selected = Signal(int)
+    scrub_started = Signal()
+    scrub_finished = Signal(int)
+    in_point_changed = Signal(int)
+    out_point_changed = Signal(int)
+    range_cleared = Signal()
 
-    def _pos_to_value(self, x: float) -> int:
-        groove = self._groove_rect()
-        if groove.width() <= 0:
-            return self.minimum()
-        ratio = (x - groove.x()) / groove.width()
-        ratio = max(0.0, min(1.0, ratio))
-        return self.minimum() + round(ratio * (self.maximum() - self.minimum()))
+    # Backwards-compatible signal aliases matching legacy MarkerOverlay expectations
+    in_point_dragged = in_point_changed
+    out_point_dragged = out_point_changed
+    scrub_to_frame = frame_selected
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._dragging = True
-            try:
-                self.grabMouse()
-            except Exception:
-                pass
-            val = self._pos_to_value(event.position().x())
-            self.setValue(val)
-            self.setSliderDown(True)
+    _MARGIN_X = 12
+    _HANDLE_HIT_PX = 12.0
+    _PLAYHEAD_HIT_PX = 11.0
+    _RULER_H = 14
+    _TRACK_TOP = 15
+    _TRACK_H = 12
+    _COV_TOP = 29
+    _COV_LANE_H = 3
+    _COV_LANE_GAP = 1
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(44)
+        self.setMinimumWidth(140)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.NoFocus)
+
+        self._total: int = 0
+        self._frame: int = 0
+        self._fps: float = 24.0
+
+        self._in_point: int | None = None
+        self._out_point: int | None = None
+
+        self._alpha_cov: list[bool] = []
+        self._infer_cov: list[bool] = []
+        self._anno_cov: list[bool] = []
+        self._waveform_peaks: list[float] = []
+
+        self._drag_mode: _DragMode = _DragMode.NONE
+        self._dragging: bool = False  # kept for compatibility checks
+        self._range_anchor_frame: int = 0
+        self._range_orig_in: int = 0
+        self._range_orig_out: int = 0
+
+        self._hover_pos: QPointF | None = None
+        self._hover_target: str | None = None  # "playhead" | "in" | "out" | "range" | "track"
+        self._hover_frame: int | None = None
+        self._show_timecode_tooltip: bool = False
+
+    # ── State & Data API ──
+
+    def set_range(self, total_frames: int) -> None:
+        self._total = max(0, int(total_frames))
+        if self._total == 0:
+            self._frame = 0
+            self._in_point = None
+            self._out_point = None
+        else:
+            self._frame = max(0, min(self._frame, self._total - 1))
+            if self._in_point is not None:
+                self._in_point = max(0, min(self._in_point, self._total - 1))
+            if self._out_point is not None:
+                self._out_point = max(0, min(self._out_point, self._total - 1))
+            if self._in_point is not None and self._out_point is not None and self._in_point > self._out_point:
+                self._in_point, self._out_point = self._out_point, self._in_point
+        self.setEnabled(self._total > 0)
+        self.update()
+
+    def set_frame(self, frame: int) -> None:
+        if self._total <= 0:
+            self._frame = 0
+        else:
+            self._frame = max(0, min(int(frame), self._total - 1))
+        self.update()
+
+    def current_frame(self) -> int:
+        return self._frame
+
+    def set_fps(self, fps: float) -> None:
+        if fps > 0:
+            self._fps = float(fps)
+            self.update()
+
+    def set_in_out(
+        self,
+        in_point: int | None,
+        out_point: int | None,
+        total_frames: int | None = None,
+    ) -> None:
+        if total_frames is not None and total_frames >= 0:
+            self._total = int(total_frames)
+        if self._total > 0:
+            self._in_point = None if in_point is None else max(0, min(int(in_point), self._total - 1))
+            self._out_point = None if out_point is None else max(0, min(int(out_point), self._total - 1))
+        else:
+            self._in_point = in_point
+            self._out_point = out_point
+        self.update()
+
+    def get_in_out(self) -> tuple[int | None, int | None]:
+        return self._in_point, self._out_point
+
+    def set_coverage(self, alpha: Sequence[bool], inference: Sequence[bool]) -> None:
+        self._alpha_cov = [bool(v) for v in alpha]
+        self._infer_cov = [bool(v) for v in inference]
+        self.update()
+
+    def set_annotation_markers(self, annotated: Sequence[bool]) -> None:
+        self._anno_cov = [bool(v) for v in annotated]
+        self.update()
+
+    def set_waveform(self, peaks: Sequence[float]) -> None:
+        self._waveform_peaks = [max(0.0, min(1.0, float(v))) for v in peaks]
+        self.update()
+
+    def set_timecode_mode(self, show_tc: bool) -> None:
+        self._show_timecode_tooltip = bool(show_tc)
+        self.update()
+
+    # ── Coordinate Mapping & Backwards-Compatible Marker Queries ──
+
+    def _track_span(self) -> tuple[float, float]:
+        x0 = float(self._MARGIN_X)
+        w = max(1.0, float(self.width() - 2 * self._MARGIN_X))
+        return x0, w
+
+    def _frame_to_x(self, frame: int) -> float:
+        x0, w = self._track_span()
+        if self._total <= 1:
+            return x0
+        frac = max(0.0, min(1.0, float(frame) / float(self._total - 1)))
+        return x0 + frac * w
+
+    def _x_to_frame(self, x: float) -> int:
+        if self._total <= 1:
+            return 0
+        x0, w = self._track_span()
+        frac = max(0.0, min(1.0, (float(x) - x0) / w))
+        return int(round(frac * float(self._total - 1)))
+
+    def _marker_x(self, which: str) -> float:
+        """Return pixel X coordinate for `"in"` or `"out"` handle (test-compatible API)."""
+        if which == "in" and self._in_point is not None:
+            return self._frame_to_x(self._in_point)
+        if which == "out" and self._out_point is not None:
+            return self._frame_to_x(self._out_point)
+        return -1000.0
+
+    def _hit_marker(self, pos) -> str | None:
+        """Return `'in'`, `'out'`, or `None` for horizontal proximity to trim handles."""
+        if self._total <= 0:
+            return None
+        px = float(pos.x()) if hasattr(pos, "x") else float(pos)
+        candidates: list[tuple[float, str]] = []
+        if self._in_point is not None:
+            d_in = abs(px - self._marker_x("in"))
+            if d_in <= self._HANDLE_HIT_PX:
+                candidates.append((d_in, "in"))
+        if self._out_point is not None:
+            d_out = abs(px - self._marker_x("out"))
+            if d_out <= self._HANDLE_HIT_PX:
+                candidates.append((d_out, "out"))
+        if not candidates:
+            return None
+        if (
+            len(candidates) == 2
+            and self._in_point is not None
+            and self._out_point is not None
+            and abs(self._marker_x("out") - self._marker_x("in")) <= 2.0
+        ):
+            # When In and Out overlap, left side selects '[' (in), right side selects ']' (out)
+            center = 0.5 * (self._marker_x("in") + self._marker_x("out"))
+            return "out" if px > center else "in"
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    def _classify_hit(self, x: float, y: float, modifiers: Qt.KeyboardModifiers, button: Qt.MouseButton) -> str:
+        """Determine hit target with vertical-band separation to prevent grab fights."""
+        if self._total <= 0:
+            return "none"
+
+        ph_x = self._frame_to_x(self._frame)
+        near_ph = abs(x - ph_x) <= self._PLAYHEAD_HIT_PX
+        marker_hit = self._hit_marker(x)
+
+        # Band 1: Ruler / Playhead Cap zone -> Playhead ALWAYS wins
+        if y <= self._RULER_H + 1 and near_ph:
+            return "playhead"
+
+        # Explicit Shift or Middle click between markers shifts entire range
+        if (
+            (button == Qt.MiddleButton or (modifiers & Qt.ShiftModifier))
+            and self._in_point is not None
+            and self._out_point is not None
+        ):
+            in_x = self._marker_x("in")
+            out_x = self._marker_x("out")
+            if min(in_x, out_x) - 4 <= x <= max(in_x, out_x) + 4:
+                return "range"
+
+        # Band 2: Bracket/track body -> check In/Out handles unless center of playhead
+        if marker_hit is not None:
+            m_x = self._marker_x(marker_hit)
+            # If playhead needle isn't right on top, or user grabbed outside ruler cap
+            if abs(x - m_x) <= abs(x - ph_x) + 4.0 or y >= self._TRACK_TOP + 2:
+                return marker_hit
+
+        if near_ph:
+            return "playhead"
+
+        # Trim highlight upper strip allows dragging [in, out] range cleanly without Shift
+        if (
+            self._in_point is not None
+            and self._out_point is not None
+            and self._TRACK_TOP <= y <= self._TRACK_TOP + 4
+        ):
+            in_x = self._marker_x("in")
+            out_x = self._marker_x("out")
+            if in_x + self._HANDLE_HIT_PX < x < out_x - self._HANDLE_HIT_PX:
+                return "range"
+
+        return "track"
+
+    # ── Mouse / Interaction ──
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._total <= 0:
+            return
+
+        if event.button() == Qt.RightButton:
+            self._show_context_menu(event.globalPosition().toPoint())
             event.accept()
             return
-        super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event):
-        if self._dragging:
-            val = self._pos_to_value(event.position().x())
-            if val != self.value():
-                self.setValue(val)
+        if event.button() not in (Qt.LeftButton, Qt.MiddleButton):
+            super().mousePressEvent(event)
+            return
+
+        pos = event.position()
+        target = self._classify_hit(pos.x(), pos.y(), event.modifiers(), event.button())
+        self._dragging = True
+
+        if target == "in":
+            self._drag_mode = _DragMode.IN_HANDLE
+            self.setCursor(Qt.SizeHorCursor)
+        elif target == "out":
+            self._drag_mode = _DragMode.OUT_HANDLE
+            self.setCursor(Qt.SizeHorCursor)
+        elif target == "range":
+            self._drag_mode = _DragMode.RANGE_SHIFT
+            self._range_anchor_frame = self._x_to_frame(pos.x())
+            self._range_orig_in = int(self._in_point or 0)
+            self._range_orig_out = int(self._out_point or max(0, self._total - 1))
+            self.setCursor(Qt.ClosedHandCursor)
+        else:
+            self._drag_mode = _DragMode.SCRUB
+            self.scrub_started.emit()
+            clicked_frame = self._x_to_frame(pos.x())
+            if clicked_frame != self._frame or target == "track":
+                self._frame = clicked_frame
+                self.frame_selected.emit(clicked_frame)
+            self.setCursor(Qt.SizeHorCursor)
+
+        self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        pos = event.position()
+        self._hover_pos = pos
+        if self._total > 0:
+            self._hover_frame = self._x_to_frame(pos.x())
+
+        if self._drag_mode == _DragMode.SCRUB and self._total > 0:
+            f = self._x_to_frame(pos.x())
+            self._hover_frame = f
+            if f != self._frame:
+                self._frame = f
+                self.frame_selected.emit(f)
+            self.update()
             event.accept()
             return
+
+        if self._drag_mode == _DragMode.IN_HANDLE and self._total > 0:
+            f = self._x_to_frame(pos.x())
+            if self._out_point is not None:
+                f = min(f, self._out_point)
+            self._hover_frame = f
+            if f != self._in_point:
+                self._in_point = f
+                self.in_point_changed.emit(f)
+            if f != self._frame:
+                self._frame = f
+                self.frame_selected.emit(f)
+            self.update()
+            event.accept()
+            return
+
+        if self._drag_mode == _DragMode.OUT_HANDLE and self._total > 0:
+            f = self._x_to_frame(pos.x())
+            if self._in_point is not None:
+                f = max(f, self._in_point)
+            self._hover_frame = f
+            if f != self._out_point:
+                self._out_point = f
+                self.out_point_changed.emit(f)
+            if f != self._frame:
+                self._frame = f
+                self.frame_selected.emit(f)
+            self.update()
+            event.accept()
+            return
+
+        if self._drag_mode == _DragMode.RANGE_SHIFT and self._total > 0:
+            f = self._x_to_frame(pos.x())
+            delta = f - self._range_anchor_frame
+            span = self._range_orig_out - self._range_orig_in
+            new_in = max(0, min(self._total - 1 - span, self._range_orig_in + delta))
+            new_out = min(self._total - 1, new_in + span)
+            changed = (new_in != self._in_point) or (new_out != self._out_point)
+            if changed:
+                self._in_point = new_in
+                self._out_point = new_out
+                self.in_point_changed.emit(new_in)
+                self.out_point_changed.emit(new_out)
+            self.update()
+            event.accept()
+            return
+
+        # Idle hover feedback
+        target = self._classify_hit(pos.x(), pos.y(), event.modifiers(), Qt.NoButton)
+        self._hover_target = target
+        if target in ("playhead", "in", "out"):
+            self.setCursor(Qt.SizeHorCursor)
+        elif target == "range":
+            self.setCursor(Qt.OpenHandCursor)
+        elif target == "track":
+            self.setCursor(Qt.PointingHandCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+        self.update()
         super().mouseMoveEvent(event)
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self._dragging:
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._drag_mode != _DragMode.NONE:
+            was_scrub = self._drag_mode == _DragMode.SCRUB
+            self._drag_mode = _DragMode.NONE
             self._dragging = False
-            try:
-                self.releaseMouse()
-            except Exception:
-                pass
-            self.setSliderDown(False)
+            if was_scrub:
+                self.scrub_finished.emit(self._frame)
+            pos = event.position()
+            target = self._classify_hit(pos.x(), pos.y(), event.modifiers(), Qt.NoButton)
+            self._hover_target = target
+            self.setCursor(
+                Qt.SizeHorCursor if target in ("playhead", "in", "out")
+                else Qt.PointingHandCursor if target == "track"
+                else Qt.ArrowCursor
+            )
+            self.update()
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
-
-class CoverageBar(QWidget):
-
-    """Thin multi-lane bar showing alpha, inference, and annotation frame coverage.
-
-
-
-    Top lane: annotation markers (green dots for annotated frames).
-
-    Middle lane: alpha hint coverage (white segments).
-
-    Bottom lane: inference output coverage (brand yellow segments).
-
-    """
-
-
-
-    _ALPHA_COLOR = QColor(200, 200, 200)       # Soft white for alpha
-
-    _INFERENCE_COLOR = QColor(255, 242, 3)      # Brand yellow #FFF203
-
-    _ANNOTATION_COLOR = QColor(44, 195, 80)     # Green #2CC350 for annotations
-
-    _TRACK_COLOR = QColor(26, 25, 0)            # Dark track
-
-    _LANE_HEIGHT = 3
-
-    _GAP = 1
-
-
-
-    def __init__(self, parent=None):
-
-        super().__init__(parent)
-
-        self._alpha: list[bool] = []
-
-        self._inference: list[bool] = []
-
-        self._annotated: list[bool] = []
-
-        self._update_height()
-
-
-
-    def _update_height(self) -> None:
-
-        """Recalculate height based on whether annotation lane is visible."""
-
-        lanes = 2  # alpha + inference always present
-
-        if self._annotated:
-
-            lanes = 3
-
-        self.setFixedHeight(self._LANE_HEIGHT * lanes + self._GAP * (lanes - 1))
-
-
-
-    def set_coverage(self, alpha: list[bool], inference: list[bool]) -> None:
-
-        self._alpha = alpha
-
-        self._inference = inference
-
+    def leaveEvent(self, event) -> None:
+        self._hover_pos = None
+        self._hover_frame = None
+        self._hover_target = None
+        if self._drag_mode == _DragMode.NONE:
+            self.setCursor(Qt.ArrowCursor)
         self.update()
+        super().leaveEvent(event)
 
-
-
-    def set_annotation_markers(self, annotated: list[bool]) -> None:
-
-        self._annotated = annotated
-
-        self._update_height()
-
-        self.update()
-
-
-
-    def clear(self) -> None:
-
-        self._alpha = []
-
-        self._inference = []
-
-        self._annotated = []
-
-        self._update_height()
-
-        self.update()
-
-
-
-    def paintEvent(self, event) -> None:
-
-        if not self._alpha and not self._inference and not self._annotated:
-
-            return
-
-
-
-        painter = QPainter(self)
-
-        painter.setRenderHint(QPainter.Antialiasing, False)
-
-        w = self.width()
-
-        y = 0
-
-
-
-        # Draw annotation lane (top, only if annotations exist)
-
-        if self._annotated:
-
-            self._paint_lane(painter, self._annotated, y, w, self._ANNOTATION_COLOR)
-
-            y += self._LANE_HEIGHT + self._GAP
-
-
-
-        # Draw alpha lane
-
-        self._paint_lane(painter, self._alpha, y, w, self._ALPHA_COLOR)
-
-        y += self._LANE_HEIGHT + self._GAP
-
-
-
-        # Draw inference lane
-
-        self._paint_lane(painter, self._inference, y, w, self._INFERENCE_COLOR)
-
-
-
-        painter.end()
-
-
-
-    def _paint_lane(
-
-        self,
-
-        painter: QPainter,
-
-        coverage: list[bool],
-
-        y: int,
-
-        total_width: int,
-
-        fill_color: QColor,
-
-    ) -> None:
-
-        n = len(coverage)
-
-        if n == 0:
-
-            return
-
-
-
-        # Draw track background
-
-        painter.fillRect(0, y, total_width, self._LANE_HEIGHT, self._TRACK_COLOR)
-
-
-
-        # Draw filled segments — batch contiguous runs for efficiency
-
-        i = 0
-
-        while i < n:
-
-            if not coverage[i]:
-
-                i += 1
-
-                continue
-
-            # Find contiguous run of True values
-
-            run_start = i
-
-            while i < n and coverage[i]:
-
-                i += 1
-
-            run_end = i
-
-            # Map frame range to pixel range
-
-            x0 = int(run_start * total_width / n)
-
-            x1 = int(run_end * total_width / n)
-
-            painter.fillRect(x0, y, max(1, x1 - x0), self._LANE_HEIGHT, fill_color)
-
-
-
-
-
-class MarkerOverlay(QWidget):
-
-    """Transparent overlay that paints in/out markers with draggable handles.
-
-
-
-    Parented to the center column widget so it shares the exact same
-
-    horizontal bounds as the coverage bar and slider.
-
-
-
-    Mouse-transparent by default (WA_TransparentForMouseEvents=True) so the
-
-    slider beneath works normally. Only becomes interactive when hovering
-
-    near a marker handle, then reverts when the mouse moves away.
-
-    """
-
-
-
-    in_point_dragged = Signal(int)
-
-    out_point_dragged = Signal(int)
-
-    scrub_to_frame = Signal(int)  # request scrubber jump during drag
-
-
-
-    GRAB_WIDTH = 16   # px hitbox for drag detection (wider for reliable grabbing)
-
-    HANDLE_W = 6      # px visible handle width
-
-    HANDLE_H = 8      # px handle nub height at bottom
-
-    MARKER_WIDTH = 2  # px bracket line width
-
-    MARKER_COLOR = QColor(255, 242, 3)      # Brand yellow
-
-    DIM_COLOR = QColor(0, 0, 0, 120)        # Semi-transparent dim
-
-
-
-    def __init__(self, parent=None):
-
-        super().__init__(parent)
-
-        self._in_point: int | None = None
-
-        self._out_point: int | None = None
-
-        self._total: int = 0
-
-        self._dragging: str | None = None  # None | 'in' | 'out'
-
-        # Start transparent — slider gets all events by default
-
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-
-
-
-    def set_in_out(self, in_point: int | None, out_point: int | None, total: int) -> None:
-
-        self._in_point = in_point
-
-        self._out_point = out_point
-
-        self._total = total
-
-        self.update()
-
-
-
-    def clear(self) -> None:
-
-        self._in_point = None
-
-        self._out_point = None
-
-        self.update()
-
-
-
-    def _frame_to_x(self, frame: int) -> int:
-
+    def _show_context_menu(self, global_pos: QPoint) -> None:
         if self._total <= 0:
-
-            return 0
-
-        return int(frame * self.width() / self._total)
-
-
-
-    def _x_to_frame(self, x: int) -> int:
-
-        if self._total <= 0 or self.width() <= 0:
-
-            return 0
-
-        return max(0, min(self._total - 1, int(x * self._total / self.width())))
-
-
-
-    def _marker_x(self, which: str) -> int | None:
-
-        """Return pixel x for in or out marker, or None if not set."""
-
-        if self._in_point is None or self._out_point is None or self._total <= 0:
-
-            return None
-
-        if which == 'in':
-
-            return self._frame_to_x(self._in_point)
-
-        else:
-
-            return self._frame_to_x(self._out_point + 1)
-
-
-
-    def _hit_marker(self, x: int) -> str | None:
-
-        """Return 'in', 'out', or None based on proximity to markers."""
-
-        x_in = self._marker_x('in')
-
-        x_out = self._marker_x('out')
-
-        if x_in is not None and abs(x - x_in) <= self.GRAB_WIDTH:
-
-            return 'in'
-
-        if x_out is not None and abs(x - x_out) <= self.GRAB_WIDTH:
-
-            return 'out'
-
-        return None
-
-
-
-    def paintEvent(self, event) -> None:
-
-        if self._in_point is None or self._out_point is None or self._total <= 0:
-
             return
-
-
-
-        painter = QPainter(self)
-
-        painter.setRenderHint(QPainter.Antialiasing, True)
-
-        w = self.width()
-
-        h = self.height()
-
-        n = self._total
-
-
-
-        x_in = int(self._in_point * w / n)
-
-        x_out = int((self._out_point + 1) * w / n)
-
-
-
-        # Dim region before in-point
-
-        if self._in_point > 0:
-
-            painter.fillRect(0, 0, x_in, h, self.DIM_COLOR)
-
-
-
-        # Dim region after out-point
-
-        if self._out_point < n - 1:
-
-            painter.fillRect(x_out, 0, w - x_out, h, self.DIM_COLOR)
-
-
-
-        # In-point bracket line
-
-        painter.fillRect(x_in, 0, self.MARKER_WIDTH, h, self.MARKER_COLOR)
-
-
-
-        # Out-point bracket line
-
-        painter.fillRect(max(0, x_out - self.MARKER_WIDTH), 0,
-
-                         self.MARKER_WIDTH, h, self.MARKER_COLOR)
-
-
-
-        # Handle nubs at bottom (small triangles pointing inward)
-
-        painter.setBrush(self.MARKER_COLOR)
-
-        painter.setPen(Qt.NoPen)
-
-
-
-        # In-point handle: triangle pointing right at bottom-left of bracket
-
-        in_tri = QPolygonF([
-
-            QPointF(x_in, h),
-
-            QPointF(x_in + self.HANDLE_W, h),
-
-            QPointF(x_in, h - self.HANDLE_H),
-
-        ])
-
-        painter.drawPolygon(in_tri)
-
-
-
-        # Out-point handle: triangle pointing left at bottom-right of bracket
-
-        ox = max(0, x_out - self.MARKER_WIDTH)
-
-        out_tri = QPolygonF([
-
-            QPointF(ox + self.MARKER_WIDTH, h),
-
-            QPointF(ox + self.MARKER_WIDTH - self.HANDLE_W, h),
-
-            QPointF(ox + self.MARKER_WIDTH, h - self.HANDLE_H),
-
-        ])
-
-        painter.drawPolygon(out_tri)
-
-
-
-        painter.end()
-
-
-
-    def _become_interactive(self) -> None:
-
-        """Grab mouse events (near a marker handle)."""
-
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-
-        self.setMouseTracking(True)
-
-        self.setCursor(Qt.SizeHorCursor)
-
-
-
-    def _become_transparent(self) -> None:
-
-        """Release mouse events back to the slider."""
-
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-
-        self.unsetCursor()
-
-
-
-    def mousePressEvent(self, event) -> None:
-
-        if event.button() == Qt.LeftButton:
-
-            hit = self._hit_marker(int(event.position().x()))
-
-            if hit:
-
-                self._dragging = hit
-
-                self.grabMouse()
-
-                event.accept()
-
-                return
-
-        elif event.button() == Qt.MiddleButton:
-
-            # Middle-click on a marker resets it to boundary
-
-            hit = self._hit_marker(int(event.position().x()))
-
-            if hit == 'in':
-
-                self._in_point = 0
-
-                self.update()
-
-                self.in_point_dragged.emit(0)
-
-                event.accept()
-
-                return
-
-            elif hit == 'out' and self._total > 0:
-
-                self._out_point = self._total - 1
-
-                self.update()
-
-                self.out_point_dragged.emit(self._total - 1)
-
-                event.accept()
-
-                return
-
-        # Missed — go transparent so slider gets future events
-
-        self._become_transparent()
-
-        event.ignore()
-
-
-
-    def mouseMoveEvent(self, event) -> None:
-
-        x = int(event.position().x())
-
-        if self._dragging:
-
-            frame = self._x_to_frame(x)
-
-            changed = False
-
-            if self._dragging == 'in':
-
-                if self._out_point is not None:
-
-                    frame = min(frame, self._out_point)
-
-                if self._in_point != frame:
-
-                    self._in_point = frame
-
-                    changed = True
-
-            else:
-
-                if self._in_point is not None:
-
-                    frame = max(frame, self._in_point)
-
-                if self._out_point != frame:
-
-                    self._out_point = frame
-
-                    changed = True
-
-            if changed:
-
-                self.update()
-
-                # Scrub the playhead so user sees current position
-
-                self.scrub_to_frame.emit(frame)
-
-            event.accept()
-
-        else:
-
-            # If mouse drifted away from marker, go transparent
-
-            hit = self._hit_marker(x)
-
-            if not hit:
-
-                self._become_transparent()
-
-            event.ignore()
-
-
-
-    def mouseReleaseEvent(self, event) -> None:
-
-        if self._dragging:
-
-            try:
-
-                self.releaseMouse()
-
-            except Exception:
-
-                pass
-
-            if self._dragging == 'in' and self._in_point is not None:
-
-                self.in_point_dragged.emit(self._in_point)
-
-            elif self._dragging == 'out' and self._out_point is not None:
-
-                self.out_point_dragged.emit(self._out_point)
-
-            self._dragging = None
-
-            # Check if still near a marker
-
-            hit = self._hit_marker(int(event.position().x()))
-
-            if not hit:
-
-                self._become_transparent()
-
+        menu = QMenu(self)
+        act_in = menu.addAction(self.tr("Set In Point at Current Frame ([)"))
+        act_out = menu.addAction(self.tr("Set Out Point at Current Frame (])"))
+        menu.addSeparator()
+        act_clear = menu.addAction(self.tr("Clear In / Out Range"))
+        act_clear.setEnabled(self._in_point is not None or self._out_point is not None)
+
+        chosen = menu.exec(global_pos)
+        if chosen == act_in:
+            new_in = self._frame
+            if self._out_point is not None and new_in > self._out_point:
+                self._out_point = new_in
+                self.out_point_changed.emit(new_in)
+            self._in_point = new_in
+            self.in_point_changed.emit(new_in)
+            self.update()
+        elif chosen == act_out:
+            new_out = self._frame
+            if self._in_point is not None and new_out < self._in_point:
+                self._in_point = new_out
+                self.in_point_changed.emit(new_out)
+            self._out_point = new_out
+            self.out_point_changed.emit(new_out)
+            self.update()
+        elif chosen == act_clear:
+            self._in_point = None
+            self._out_point = None
+            self.range_cleared.emit()
             self.update()
 
-            event.accept()
+    # ── Custom NLE Painting ──
 
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        w = float(self.width())
+        h = float(self.height())
+        x0, track_w = self._track_span()
+
+        # Background tray groove
+        painter.fillRect(QRectF(0, 0, w, h), QColor("#0D0D06"))
+        track_rect = QRectF(x0, self._TRACK_TOP, track_w, self._TRACK_H)
+        painter.setPen(QPen(QColor("#2A2918"), 1.0))
+        painter.setBrush(QColor("#16160D"))
+        painter.drawRoundedRect(track_rect, 2.0, 2.0)
+
+        if self._total <= 0:
+            painter.end()
+            return
+
+        # 1. Adaptive ruler ticks + subtle labels
+        self._paint_ruler_ticks(painter, x0, track_w)
+
+        # 2. Trim range shading & active bar
+        self._paint_trim_region(painter, x0, track_w)
+
+        # 2b. Audio waveform peaks inside track groove
+        if self._waveform_peaks:
+            n_peaks = len(self._waveform_peaks)
+            mid_y = self._TRACK_TOP + self._TRACK_H * 0.5
+            max_half = self._TRACK_H * 0.45
+            painter.setPen(QPen(QColor(135, 210, 140, 145), 1.0))
+            for i, amp in enumerate(self._waveform_peaks):
+                if amp <= 0.02:
+                    continue
+                px = x0 + (float(i) / max(1, n_peaks - 1)) * track_w
+                hh = amp * max_half
+                painter.drawLine(QPointF(px, mid_y - hh), QPointF(px, mid_y + hh))
+
+        # 3. 3-lane bottom coverage strip
+        self._paint_coverage_lanes(painter, x0, track_w)
+
+        # 4. Hover hairline guide (under playhead & handles)
+        if self._hover_frame is not None and self._drag_mode == _DragMode.NONE:
+            hx = self._frame_to_x(self._hover_frame)
+            painter.setPen(QPen(QColor(255, 255, 255, 55), 1.0, Qt.DashLine))
+            painter.drawLine(QPointF(hx, self._RULER_H), QPointF(hx, h - 2))
+
+        # 5. In / Out NLE bracket handles
+        if self._in_point is not None:
+            self._paint_bracket_handle(
+                painter,
+                self._frame_to_x(self._in_point),
+                kind="in",
+                highlighted=(self._hover_target == "in" or self._drag_mode == _DragMode.IN_HANDLE),
+            )
+        if self._out_point is not None:
+            self._paint_bracket_handle(
+                painter,
+                self._frame_to_x(self._out_point),
+                kind="out",
+                highlighted=(self._hover_target == "out" or self._drag_mode == _DragMode.OUT_HANDLE),
+            )
+
+        # 6. Playhead needle + diamond/pentagon cap
+        self._paint_playhead(painter, self._frame_to_x(self._frame))
+
+        # 7. Hover frame / timecode badge pill
+        if self._hover_frame is not None and self._hover_pos is not None:
+            self._paint_hover_pill(painter, w)
+
+        painter.end()
+
+    def _paint_ruler_ticks(self, painter: QPainter, x0: float, track_w: float) -> None:
+        if self._total <= 1:
+            return
+        px_per_frame = track_w / float(max(1, self._total - 1))
+        for step in (1, 2, 5, 10, 25, 50, 100, 250, 500):
+            if step * px_per_frame >= 46.0:
+                major = step
+                break
         else:
+            major = 1000
+        minor = max(1, major // 5)
 
-            event.ignore()
+        font = QFont("Consolas", 8)
+        if not font.exactMatch():
+            font = QFont(self.font().family(), 8)
+        painter.setFont(font)
 
+        for f in range(0, self._total, minor):
+            x = self._frame_to_x(f)
+            is_major = (f % major == 0)
+            if is_major:
+                painter.setPen(QPen(QColor("#5C5B44"), 1.0))
+                painter.drawLine(QPointF(x, 4.0), QPointF(x, float(self._RULER_H)))
+                painter.setPen(QColor("#807F65"))
+                lbl = str(f + 1)
+                tx = x + 3.0 if x + 28.0 < x0 + track_w else x - 26.0
+                painter.drawText(QPointF(tx, 10.5), lbl)
+            elif minor * px_per_frame >= 7.0:
+                painter.setPen(QPen(QColor("#343324"), 1.0))
+                painter.drawLine(QPointF(x, 9.0), QPointF(x, float(self._RULER_H)))
+
+    def _paint_trim_region(self, painter: QPainter, x0: float, track_w: float) -> None:
+        if self._in_point is None and self._out_point is None:
+            return
+        in_x = self._frame_to_x(self._in_point if self._in_point is not None else 0)
+        out_x = self._frame_to_x(self._out_point if self._out_point is not None else max(0, self._total - 1))
+        lo_x = min(in_x, out_x)
+        hi_x = max(in_x, out_x)
+
+        # Dim out-of-range track segments
+        if lo_x > x0:
+            painter.fillRect(
+                QRectF(x0, self._TRACK_TOP, lo_x - x0, self._TRACK_H),
+                QColor(0, 0, 0, 145),
+            )
+        right_edge = x0 + track_w
+        if hi_x < right_edge:
+            painter.fillRect(
+                QRectF(hi_x, self._TRACK_TOP, right_edge - hi_x, self._TRACK_H),
+                QColor(0, 0, 0, 145),
+            )
+
+        # Highlight active work-area span
+        active_rect = QRectF(lo_x, self._TRACK_TOP, max(2.0, hi_x - lo_x), self._TRACK_H)
+        fill_alpha = 52 if (self._hover_target == "range" or self._drag_mode == _DragMode.RANGE_SHIFT) else 34
+        painter.fillRect(active_rect, QColor(255, 242, 3, fill_alpha))
+
+        top_bar_color = QColor("#FFF203") if self._hover_target == "range" else QColor("#B9AD18")
+        painter.fillRect(QRectF(lo_x, self._TRACK_TOP, max(2.0, hi_x - lo_x), 2.5), top_bar_color)
+
+    def _paint_coverage_lanes(self, painter: QPainter, x0: float, track_w: float) -> None:
+        n = max(self._total, len(self._alpha_cov), len(self._infer_cov), len(self._anno_cov))
+        if n <= 0:
+            return
+        lanes = (
+            (self._alpha_cov, QColor("#2CC350"), QColor("#151C16")),
+            (self._infer_cov, QColor("#FFF203"), QColor("#1C1B10")),
+            (self._anno_cov, QColor("#00D4FF"), QColor("#101A1E")),
+        )
+        for lane_idx, (flags, fg_color, bg_color) in enumerate(lanes):
+            ly = float(self._COV_TOP + lane_idx * (self._COV_LANE_H + self._COV_LANE_GAP))
+            painter.fillRect(QRectF(x0, ly, track_w, float(self._COV_LANE_H)), bg_color)
+            if not flags or not any(flags):
+                continue
+            m = len(flags)
+            # Coalesce contiguous runs for ultra-fast painting even on long sequences
+            run_start: int | None = None
+            for i, val in enumerate(flags):
+                if val and run_start is None:
+                    run_start = i
+                elif not val and run_start is not None:
+                    sx = x0 + (run_start / max(1, m - 1 if m > 1 else 1)) * track_w if m > 1 else x0
+                    ex = x0 + ((i - 1) / max(1, m - 1)) * track_w if m > 1 else x0 + track_w
+                    sw = max(3.0, ex - sx)
+                    painter.fillRect(QRectF(sx - 1.0, ly, sw, float(self._COV_LANE_H)), fg_color)
+                    run_start = None
+            if run_start is not None:
+                sx = x0 + (run_start / max(1, m - 1)) * track_w if m > 1 else x0
+                ex = x0 + track_w
+                sw = max(3.0, ex - sx)
+                painter.fillRect(QRectF(sx - 1.0, ly, sw, float(self._COV_LANE_H)), fg_color)
+
+    def _paint_bracket_handle(
+        self,
+        painter: QPainter,
+        x: float,
+        *,
+        kind: str,
+        highlighted: bool,
+    ) -> None:
+        base_color = QColor("#00D4FF") if kind == "in" else QColor("#FF8C00")
+        color = base_color.lighter(125) if highlighted else base_color
+        glow = QColor(color)
+        glow.setAlpha(75 if highlighted else 35)
+
+        top_y = float(self._TRACK_TOP - 2)
+        bot_y = float(self._TRACK_TOP + self._TRACK_H + 3)
+        tab_dir = 1.0 if kind == "in" else -1.0
+
+        # Subtle wider grip halo so targets feel responsive
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(glow)
+        painter.drawRoundedRect(QRectF(x - 4.0, top_y, 8.0, bot_y - top_y), 2.0, 2.0)
+
+        pen = QPen(color, 2.2 if highlighted else 1.8)
+        pen.setCapStyle(Qt.SquareCap)
+        pen.setJoinStyle(Qt.MiterJoin)
+        painter.setPen(pen)
+        # Bracket `[` or `]`
+        painter.drawLine(QPointF(x, top_y), QPointF(x, bot_y))
+        painter.drawLine(QPointF(x, top_y), QPointF(x + tab_dir * 6.5, top_y))
+        painter.drawLine(QPointF(x, bot_y), QPointF(x + tab_dir * 6.5, bot_y))
+
+    def _paint_playhead(self, painter: QPainter, x: float) -> None:
+        active = self._hover_target == "playhead" or self._drag_mode == _DragMode.SCRUB
+        color = QColor("#FFF740") if active else QColor("#FFF203")
+
+        # Subtle vertical needle halo
+        halo = QColor(color)
+        halo.setAlpha(65 if active else 30)
+        painter.setPen(QPen(halo, 6.0))
+        painter.drawLine(QPointF(x, 12.0), QPointF(x, float(self.height()) - 2.0))
+
+        # Crisp playhead vertical needle
+        painter.setPen(QPen(color, 2.0))
+        painter.drawLine(QPointF(x, 11.0), QPointF(x, float(self.height()) - 2.0))
+
+        # Pentagon / diamond playhead handle cap at the top ruler band
+        w_half = 6.5 if active else 5.5
+        cap = QPolygonF([
+            QPointF(x - w_half, 1.5),
+            QPointF(x + w_half, 1.5),
+            QPointF(x + w_half, 7.5),
+            QPointF(x, 13.5),
+            QPointF(x - w_half, 7.5),
+        ])
+        painter.setPen(QPen(QColor("#1A1900"), 1.0))
+        painter.setBrush(color)
+        painter.drawPolygon(cap)
+
+    def _paint_hover_pill(self, painter: QPainter, w: float) -> None:
+        if self._hover_frame is None:
+            return
+        if self._show_timecode_tooltip:
+            text = _format_timecode(self._hover_frame, self._fps)
+        else:
+            text = f"F {self._hover_frame + 1:04d}"
+
+        font = QFont("Consolas", 8, QFont.Bold)
+        if not font.exactMatch():
+            font = QFont(self.font().family(), 8, QFont.Bold)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        tw = fm.horizontalAdvance(text) + 10.0
+        th = 14.0
+
+        hx = self._frame_to_x(self._hover_frame)
+        px = max(2.0, min(w - tw - 2.0, hx - tw * 0.5))
+        py = 1.0
+        rect = QRectF(px, py, tw, th)
+
+        painter.setPen(QPen(QColor("#555432"), 1.0))
+        painter.setBrush(QColor(22, 22, 12, 232))
+        painter.drawRoundedRect(rect, 3.0, 3.0)
+        painter.setPen(QColor("#FFF203"))
+        painter.drawText(rect, Qt.AlignCenter, text)
+
+
+# ── Backwards-Compatible Thin Helpers (safe if imported externally) ──
+
+
+class _FatSlider(QSlider):
+    """Legacy slider compatibility class."""
+
+
+class CoverageBar(QWidget):
+    """Legacy standalone coverage bar shim."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(12)
+        self._alpha: list[bool] = []
+        self._inference: list[bool] = []
+        self._annotated: list[bool] = []
+
+    def set_coverage(self, alpha: list[bool], inference: list[bool]) -> None:
+        self._alpha = list(alpha)
+        self._inference = list(inference)
+        self.update()
+
+    def set_annotation_markers(self, annotated: list[bool]) -> None:
+        self._annotated = list(annotated)
+        self.update()
+
+
+class MarkerOverlay(StudioTimelineCanvas):
+    """Legacy MarkerOverlay compatibility alias backed by StudioTimelineCanvas."""
+
+
+__all__ = [
+    "_DragMode",
+    "_FatSlider",
+    "CoverageBar",
+    "MarkerOverlay",
+    "StudioTimelineCanvas",
+]

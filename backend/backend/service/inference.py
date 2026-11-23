@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Callable, Optional
 
 import cv2
@@ -44,12 +44,21 @@ class InferenceMixin(ParallelInferenceMixin):
         try:
             if clip.input_asset is None:
                 return "green"
-            files = clip.input_asset.get_frame_files()
-            if not files:
-                return "green"
-            mid_idx = len(files) // 2
-            fpath = os.path.join(clip.input_asset.path, files[mid_idx])
-            frame = read_image_frame(fpath)
+            frame = None
+            mid_idx = 0
+            total_n = 0
+            if clip.input_asset.asset_type == "video":
+                total_n = max(1, int(clip.input_asset.frame_count or 1))
+                mid_idx = total_n // 2
+                frame = read_video_frame_at(clip.input_asset.path, mid_idx)
+            else:
+                files = clip.input_asset.get_frame_files()
+                if not files:
+                    return "green"
+                total_n = len(files)
+                mid_idx = total_n // 2
+                fpath = os.path.join(clip.input_asset.path, files[mid_idx])
+                frame = read_image_frame(fpath)
             if frame is None:
                 return "green"
             # detect_screen_color expects uint8; convert from float32 [0,1]
@@ -58,7 +67,7 @@ class InferenceMixin(ParallelInferenceMixin):
             result = detect_screen_color(frame)
             clip._screen_color_cache = result
             logger.info("Auto-detected screen color for '%s': %s (frame %d/%d)",
-                        clip.name, result, mid_idx, len(files))
+                        clip.name, result, mid_idx, total_n)
             return result
         except Exception as e:
             logger.warning("Screen color detection failed for '%s': %s", clip.name, e)
@@ -85,9 +94,16 @@ class InferenceMixin(ParallelInferenceMixin):
         if clip.input_asset is None:
             raise CorridorKeyError(f"Clip '{clip.name}' missing input asset")
 
+        # Resolve "auto" screen color from the clip's middle frame BEFORE v2 or v1 dispatch
+        if getattr(params, "screen_color", "green") == "auto":
+            from .core import InferenceParams
+            resolved = self._resolve_screen_color(clip)
+            params = InferenceParams(**{**params.to_dict(), "screen_color": resolved})
+
         package_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        v2_weights = os.path.join(package_root, "weights", "corridorkey_v2.safetensors")
-        if os.path.isfile(v2_weights):
+        v2_safetensors = os.path.join(package_root, "weights", "corridorkey_v2.safetensors")
+        v2_pt = os.path.join(package_root, "weights", "corridorkey_v2.pt")
+        if os.path.isfile(v2_safetensors) or os.path.isfile(v2_pt):
             return self._run_inference_v2(
                 clip, params, job=job,
                 on_progress=on_progress, on_warning=on_warning,
@@ -97,12 +113,6 @@ class InferenceMixin(ParallelInferenceMixin):
 
         if clip.alpha_asset is None:
             raise CorridorKeyError(f"Clip '{clip.name}' missing alpha asset for v1 inference")
-
-        # Resolve "auto" screen color from the clip's middle frame
-        if params.screen_color == "auto":
-            from .core import InferenceParams
-            resolved = self._resolve_screen_color(clip)
-            params = InferenceParams(**{**params.to_dict(), "screen_color": resolved})
 
         self._begin_inference()
         try:
@@ -131,13 +141,69 @@ class InferenceMixin(ParallelInferenceMixin):
             self._end_inference()
 
     @staticmethod
+    def _load_clean_plate_rgb(params) -> Optional[np.ndarray]:
+        if not bool(getattr(params, "clean_plate_enabled", False)):
+            return None
+        cpath = str(getattr(params, "clean_plate_path", "") or "").strip()
+        if not cpath or not os.path.isfile(cpath):
+            return None
+        from ..frame_io import imread_unicode
+        img = imread_unicode(cpath, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        if img.ndim == 2:
+            bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.shape[2] >= 4:
+            bgr = img[:, :, :3]
+        else:
+            bgr = img
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if rgb.dtype == np.uint8:
+            return rgb.astype(np.float32) * (1.0 / 255.0)
+        if rgb.dtype == np.uint16:
+            return rgb.astype(np.float32) * (1.0 / 65535.0)
+        return np.clip(rgb.astype(np.float32), 0.0, 1.0)
+
+    @staticmethod
     def _postprocess_alpha_v2(
         alpha_f32: np.ndarray,
         params,
         hint_mask_u8: Optional[np.ndarray] = None,
+        *,
+        polygon_shapes=None,
+        frame_index: int = 0,
+        clean_plate_rgb: Optional[np.ndarray] = None,
+        frame_rgb_f32: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Apply EZ-CorridorKey despeckle and garbage matte parameters to [H, W] float32 alpha."""
+        """Apply Alpha Levels, clean plate diff, despeckle, garbage matte, edge choke/grow, feather, and polygons."""
         alpha = np.clip(alpha_f32.astype(np.float32), 0.0, 1.0)
+
+        if (
+            bool(getattr(params, "clean_plate_enabled", False))
+            and clean_plate_rgb is not None
+            and frame_rgb_f32 is not None
+        ):
+            from backend.keying_post import apply_clean_plate_difference
+            alpha = apply_clean_plate_difference(
+                alpha,
+                frame_rgb_f32,
+                clean_plate_rgb,
+                strength=float(getattr(params, "clean_plate_strength", 0.5) or 0.5),
+                screen_color=str(getattr(params, "screen_color", "green") or "green"),
+            )
+
+        clip_black = float(getattr(params, "alpha_clip_black", 0.0) or 0.0)
+        clip_white_raw = getattr(params, "alpha_clip_white", 1.0)
+        clip_white = float(1.0 if clip_white_raw is None else clip_white_raw)
+        gamma = float(getattr(params, "alpha_gamma", 1.0) or 1.0)
+        clip_black = max(0.0, min(0.98, clip_black))
+        clip_white = max(clip_black + 0.01, min(1.0, clip_white))
+        gamma = max(0.1, min(4.0, gamma))
+        if clip_black > 0.0 or clip_white < 1.0 or abs(gamma - 1.0) > 1e-4:
+            alpha = np.clip((alpha - clip_black) / max(clip_white - clip_black, 1e-4), 0.0, 1.0)
+            if abs(gamma - 1.0) > 1e-4:
+                alpha = np.power(alpha, 1.0 / gamma)
+
         auto_despeckle = bool(getattr(params, "auto_despeckle", True))
         despeckle_size = int(getattr(params, "despeckle_size", 400))
         if auto_despeckle and despeckle_size > 0:
@@ -163,6 +229,24 @@ class InferenceMixin(ParallelInferenceMixin):
             feather = max(3, (garbage_px // 2) | 1)
             soft = cv2.GaussianBlur(dilated.astype(np.float32), (feather, feather), 0)
             alpha = alpha * np.clip(soft, 0.0, 1.0)
+
+        erode_px = int(getattr(params, "edge_erode_px", 0) or 0)
+        if erode_px != 0:
+            ek = abs(erode_px) * 2 + 1
+            ekernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek, ek))
+            if erode_px < 0:
+                alpha = cv2.erode(alpha, ekernel)
+            else:
+                alpha = cv2.dilate(alpha, ekernel)
+
+        blur_px = int(getattr(params, "edge_blur_px", 0) or 0)
+        if blur_px > 0:
+            bk = max(3, (blur_px * 2 + 1) | 1)
+            alpha = cv2.GaussianBlur(alpha, (bk, bk), 0)
+
+        if polygon_shapes:
+            from backend.matte_shapes import apply_polygon_mattes
+            alpha = apply_polygon_mattes(alpha, polygon_shapes, int(frame_index))
 
         return np.clip(alpha, 0.0, 1.0)
 
@@ -375,7 +459,7 @@ class InferenceMixin(ParallelInferenceMixin):
         import tempfile
         from pathlib import Path
         from .core import FrameResult, OutputConfig
-        from ..frame_io import imread_unicode
+        from ..frame_io import imread_unicode, imwrite_unicode
         from corridorkey import color_utils as cu
         from corridorkey.runtime import InferenceConfig, WriterConfig, run_inference as ck2_run_inference
 
@@ -401,6 +485,9 @@ class InferenceMixin(ParallelInferenceMixin):
                 lo = max(0, frame_range[0])
                 hi = min(len(all_files) - 1, frame_range[1])
                 files = all_files[lo:hi + 1]
+            elif not is_seq and frame_range is not None:
+                lo = max(0, frame_range[0])
+                files = all_files
             else:
                 lo = 0
                 files = all_files
@@ -497,16 +584,40 @@ class InferenceMixin(ParallelInferenceMixin):
             local_ffmpeg = package_root / "ffmpeg" / "ffmpeg.exe"
             ffmpeg_bin = str(local_ffmpeg) if local_ffmpeg.is_file() else "ffmpeg"
 
-            writer_cfg = WriterConfig(
-                ffmpeg_bin=ffmpeg_bin,
-                codec="libx264",
-                crf=int(getattr(params, "crf", 12)),
-                preset=str(getattr(params, "preset", "medium")),
-                pix_fmt=str(getattr(params, "pix_fmt", "yuv444p10le")),
-                threads=2,
-            )
+            export_codec = str(getattr(params, "export_codec", "h264") or "h264").lower()
+            if export_codec == "prores_4444":
+                writer_cfg = WriterConfig(
+                    ffmpeg_bin=ffmpeg_bin,
+                    codec="prores_ks",
+                    crf=0,
+                    preset="4",
+                    pix_fmt="yuva444p10le",
+                    threads=2,
+                )
+            elif export_codec == "prores_422hq":
+                writer_cfg = WriterConfig(
+                    ffmpeg_bin=ffmpeg_bin,
+                    codec="prores_ks",
+                    crf=0,
+                    preset="3",
+                    pix_fmt="yuv422p10le",
+                    threads=2,
+                )
+            else:
+                writer_cfg = WriterConfig(
+                    ffmpeg_bin=ffmpeg_bin,
+                    codec="libx264",
+                    crf=int(getattr(params, "crf", 12)),
+                    preset=str(getattr(params, "preset", "medium")),
+                    pix_fmt=str(getattr(params, "pix_fmt", "yuv444p10le")),
+                    threads=2,
+                )
 
-            despill = float(getattr(params, "despill_strength", 0.5))
+            despill = (
+                float(getattr(params, "despill_strength", 0.5))
+                if bool(getattr(params, "despill_enabled", True))
+                else 0.0
+            )
             frame_dir_linear = bool(getattr(params, "input_is_linear", False))
             cutout_linear = bool(getattr(params, "cutout_linear", False))
             auto_vram = bool(getattr(params, "auto_vram", True))
@@ -526,6 +637,10 @@ class InferenceMixin(ParallelInferenceMixin):
                 output_format = "video"
             exr_dtype = str(getattr(cfg, "exr_dtype", getattr(params, "exr_dtype", "half")))
 
+            screen_color_resolved = str(getattr(params, "screen_color", "green") or "green").lower()
+            if screen_color_resolved == "auto":
+                screen_color_resolved = self._resolve_screen_color(clip)
+
             infer_cfg = InferenceConfig(
                 hann_chunk=hann_chunk,
                 hann_stride=hann_stride,
@@ -540,6 +655,7 @@ class InferenceMixin(ParallelInferenceMixin):
                 linear_contrast=linear_contrast,
                 linear_contrast_pivot=linear_contrast_pivot,
                 despill_strength=despill,
+                screen_color=screen_color_resolved,
                 frame_dir_linear=frame_dir_linear,
                 cutout_linear=cutout_linear,
                 outputs={"alpha", "fg", "checker", "cutout"},
@@ -547,13 +663,32 @@ class InferenceMixin(ParallelInferenceMixin):
                 exr_dtype=exr_dtype,
             )
             if not is_seq and frame_range is not None:
-                infer_cfg.num_frames = frame_range[1] - frame_range[0] + 1
+                infer_cfg.start_frame = lo
+                infer_cfg.num_frames = max(1, frame_range[1] - lo + 1)
+
+            from backend.matte_shapes import PolygonMatteModel
+            polygon_shapes = PolygonMatteModel.load_from_clip(clip.root_path).shapes
+            has_levels_adj = (
+                float(getattr(params, "alpha_clip_black", 0.0) or 0.0) > 0.0
+                or float(getattr(params, "alpha_clip_white", 1.0) if getattr(params, "alpha_clip_white", None) is not None else 1.0) < 1.0
+                or abs(float(getattr(params, "alpha_gamma", 1.0) or 1.0) - 1.0) > 1e-4
+            )
+
+            clean_plate_rgb = self._load_clean_plate_rgb(params)
+            adv_despill_enabled = bool(getattr(params, "advanced_despill_enabled", False))
+            clean_plate_enabled = clean_plate_rgb is not None
 
             results: list[FrameResult] = []
             skipped: list[int] = []
             need_post = (
                 bool(getattr(params, "auto_despeckle", True))
                 or int(getattr(params, "garbage_matte_px", 0)) > 0
+                or int(getattr(params, "edge_erode_px", 0)) != 0
+                or int(getattr(params, "edge_blur_px", 0)) > 0
+                or has_levels_adj
+                or bool(polygon_shapes)
+                or adv_despill_enabled
+                or clean_plate_enabled
                 or cfg.fg_format == "exr"
                 or cfg.matte_format == "exr"
                 or cfg.comp_format == "exr"
@@ -575,20 +710,20 @@ class InferenceMixin(ParallelInferenceMixin):
                     if "checker" in f_dict and cfg.comp_enabled:
                         comp_u16 = f_dict["checker"]
                         comp_u8 = (comp_u16 >> 8).astype(np.uint8) if comp_u16.dtype == np.uint16 else (np.clip(comp_u16, 0, 1) * 255).astype(np.uint8)
-                        cv2.imwrite(os.path.join(dirs['comp'], f"{stem}.png"), comp_u8)
+                        imwrite_unicode(os.path.join(dirs['comp'], f"{stem}.png"), comp_u8)
 
                     if "alpha" in f_dict and cfg.matte_enabled:
                         alpha_raw = f_dict["alpha"]
                         alpha_plane = alpha_raw[:, :, 0] if alpha_raw.ndim == 3 else alpha_raw
                         alpha_u8 = (alpha_plane >> 8).astype(np.uint8) if alpha_plane.dtype == np.uint16 else (np.clip(alpha_plane, 0, 1) * 255).astype(np.uint8)
-                        cv2.imwrite(os.path.join(dirs['matte'], f"{stem}.png"), alpha_u8)
+                        imwrite_unicode(os.path.join(dirs['matte'], f"{stem}.png"), alpha_u8)
 
                     if "fg" in f_dict and cfg.fg_enabled:
                         fg_u16 = f_dict["fg"]
                         fg_u8 = (fg_u16 >> 8).astype(np.uint8) if fg_u16.dtype == np.uint16 else (np.clip(fg_u16, 0, 1) * 255).astype(np.uint8)
-                        cv2.imwrite(os.path.join(dirs['fg'], f"{stem}.png"), fg_u8)
+                        imwrite_unicode(os.path.join(dirs['fg'], f"{stem}.png"), fg_u8)
                 else:
-                    # Convert rendered BGR/alpha to float32 [0, 1], apply despeckle & garbage matte, and use _write_outputs
+                    # Convert rendered BGR/alpha to float32, apply despeckle, edge refine, & garbage matte
                     alpha_raw = f_dict.get("alpha")
                     if alpha_raw is not None:
                         alpha_plane = alpha_raw[:, :, 0] if alpha_raw.ndim == 3 else alpha_raw
@@ -603,36 +738,109 @@ class InferenceMixin(ParallelInferenceMixin):
                     hint_mask = None
                     if use_hint and int(getattr(params, "garbage_matte_px", 0)) > 0 and stem in hint_lookup:
                         hint_mask = imread_unicode(hint_lookup[stem], cv2.IMREAD_GRAYSCALE)
-                    alpha_f = self._postprocess_alpha_v2(alpha_f, params, hint_mask_u8=hint_mask)
+                    frame_rgb_for_cp = None
+                    if clean_plate_rgb is not None and is_seq and frame_k < len(files):
+                        from ..frame_io import read_image_frame as _read_img_frame
+                        cp_in = _read_img_frame(os.path.join(clip.input_asset.path, files[frame_k]))
+                        if cp_in is not None:
+                            frame_rgb_for_cp = (
+                                cp_in.astype(np.float32) / 255.0
+                                if cp_in.dtype == np.uint8
+                                else np.clip(cp_in.astype(np.float32), 0.0, 1.0)
+                            )
+                    alpha_f = self._postprocess_alpha_v2(
+                        alpha_f,
+                        params,
+                        hint_mask_u8=hint_mask,
+                        polygon_shapes=polygon_shapes,
+                        frame_index=abs_idx,
+                        clean_plate_rgb=clean_plate_rgb,
+                        frame_rgb_f32=frame_rgb_for_cp,
+                    )
 
                     fg_raw = f_dict.get("fg")
-                    if fg_raw is not None:
+                    is_exr_linear = (output_format == "exr" and fg_raw is not None and fg_raw.dtype != np.uint16)
+                    checker = cu.make_checkerboard(alpha_f.shape[0], alpha_f.shape[1])
+                    a3 = alpha_f[:, :, np.newaxis]
+
+                    if fg_raw is None:
+                        fg_despilled = np.zeros((*alpha_f.shape[:2], 3), dtype=np.float32)
+                        comp_rgb = fg_despilled * a3 + checker * (1.0 - a3)
+                        fg_lin = fg_despilled
+                        proc_rgba = np.concatenate([fg_lin * a3, a3], axis=-1)
+                        res_dict = {
+                            "fg": fg_despilled,
+                            "fg_is_linear": False,
+                            "alpha": alpha_f,
+                            "comp": comp_rgb,
+                            "processed": proc_rgba,
+                        }
+                    elif is_exr_linear:
+                        # Unclamped scene-linear float32 from runtime EXR renderer
+                        fg_lin_rgb = cv2.cvtColor(fg_raw.astype(np.float32), cv2.COLOR_BGR2RGB)
+                        fg_lin_despilled = fg_lin_rgb.copy()
+                        if despill > 0.0:
+                            if screen_color_resolved == "blue":
+                                lim = (fg_lin_despilled[..., 0] + fg_lin_despilled[..., 1]) * 0.5
+                                excess = np.maximum(0.0, fg_lin_despilled[..., 2] - lim)
+                                fg_lin_despilled[..., 2] -= excess * despill
+                            else:
+                                lim = (fg_lin_despilled[..., 0] + fg_lin_despilled[..., 2]) * 0.5
+                                excess = np.maximum(0.0, fg_lin_despilled[..., 1] - lim)
+                                fg_lin_despilled[..., 1] -= excess * despill
+                        fg_srgb = np.clip(cu.linear_to_srgb(np.maximum(fg_lin_despilled, 0.0)), 0.0, 1.0)
+                        comp_rgb = fg_srgb * a3 + checker * (1.0 - a3)
+                        proc_rgba = np.concatenate([fg_lin_despilled * a3, a3], axis=-1)
+                        res_dict = {
+                            "fg": fg_lin_despilled if cfg.fg_format == "exr" else fg_srgb,
+                            "fg_is_linear": (cfg.fg_format == "exr"),
+                            "alpha": alpha_f,
+                            "comp": comp_rgb,
+                            "processed": proc_rgba,
+                        }
+                    else:
                         fg_bgr = (
                             fg_raw.astype(np.float32) / 65535.0
                             if fg_raw.dtype == np.uint16
                             else np.clip(fg_raw.astype(np.float32), 0.0, 1.0)
                         )
                         fg_rgb = cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2RGB)
-                    else:
-                        fg_rgb = np.zeros((*alpha_f.shape[:2], 3), dtype=np.float32)
+                        if adv_despill_enabled:
+                            from backend.keying_post import advanced_despill, apply_edge_extend, apply_light_wrap
+                            fg_despilled = advanced_despill(
+                                fg_rgb,
+                                strength=despill,
+                                screen_color=screen_color_resolved,
+                                mode=str(getattr(params, "despill_mode", "average") or "average"),
+                                luma_restore=float(getattr(params, "despill_luma_restore", 0.0) or 0.0),
+                            )
+                            fg_despilled = apply_edge_extend(
+                                fg_despilled, alpha_f, int(getattr(params, "edge_extend_px", 0) or 0)
+                            )
+                            fg_despilled = apply_light_wrap(
+                                fg_despilled,
+                                checker,
+                                alpha_f,
+                                strength=float(getattr(params, "light_wrap_strength", 0.0) or 0.0),
+                                radius_px=int(getattr(params, "light_wrap_radius", 12) or 12),
+                            )
+                        else:
+                            fg_despilled = cu.despill(
+                                fg_rgb,
+                                strength=despill,
+                                screen_color=screen_color_resolved,
+                            )
+                        comp_rgb = fg_despilled * a3 + checker * (1.0 - a3)
+                        fg_lin = cu.srgb_to_linear(np.clip(fg_despilled, 0.0, 1.0))
+                        proc_rgba = np.concatenate([fg_lin * a3, a3], axis=-1)
+                        res_dict = {
+                            "fg": fg_despilled,
+                            "fg_is_linear": False,
+                            "alpha": alpha_f,
+                            "comp": comp_rgb,
+                            "processed": proc_rgba,
+                        }
 
-                    fg_despilled = cu.despill(
-                        fg_rgb,
-                        strength=despill,
-                        screen_color=getattr(params, "screen_color", "green"),
-                    )
-                    checker = cu.make_checkerboard(alpha_f.shape[0], alpha_f.shape[1])
-                    a3 = alpha_f[:, :, np.newaxis]
-                    comp_rgb = fg_despilled * a3 + checker * (1.0 - a3)
-                    fg_lin = cu.srgb_to_linear(np.clip(fg_despilled, 0.0, 1.0))
-                    proc_rgba = np.concatenate([fg_lin * a3, a3], axis=-1)
-
-                    res_dict = {
-                        "fg": fg_despilled,
-                        "alpha": alpha_f,
-                        "comp": comp_rgb,
-                        "processed": proc_rgba,
-                    }
                     self._write_outputs(res_dict, dirs, stem, clip.name, abs_idx, cfg)
 
                 results.append(FrameResult(abs_idx, stem, True))
@@ -668,6 +876,43 @@ class InferenceMixin(ParallelInferenceMixin):
                     on_status=on_status,
                     is_cancelled=is_cancelled_check,
                 )
+
+            if bool(getattr(params, "temporal_deflicker_enabled", False)) and cfg.matte_enabled:
+                from backend.keying_post import apply_temporal_alpha_deflicker
+                from backend.natural_sort import natsorted
+                matte_dir = dirs["matte"]
+                if os.path.isdir(matte_dir):
+                    mfiles = natsorted(f for f in os.listdir(matte_dir) if f.lower().endswith(".png"))
+                    if len(mfiles) >= 3:
+                        raw_alphas = []
+                        for mf in mfiles:
+                            am = imread_unicode(os.path.join(matte_dir, mf), cv2.IMREAD_GRAYSCALE)
+                            if am is not None:
+                                raw_alphas.append(am.astype(np.float32) * (1.0 / 255.0))
+                        if len(raw_alphas) == len(mfiles):
+                            smoothed = apply_temporal_alpha_deflicker(
+                                raw_alphas,
+                                strength=float(getattr(params, "temporal_deflicker_strength", 0.35) or 0.35),
+                                radius=int(getattr(params, "temporal_deflicker_radius", 1) or 1),
+                            )
+                            fg_dir = dirs.get("fg")
+                            comp_dir = dirs.get("comp")
+                            for mf, a_sm in zip(mfiles, smoothed):
+                                a_u8 = (np.clip(a_sm, 0.0, 1.0) * 255.0).astype(np.uint8)
+                                imwrite_unicode(os.path.join(matte_dir, mf), a_u8)
+                                if cfg.comp_enabled and fg_dir and comp_dir:
+                                    fg_p = os.path.join(fg_dir, mf)
+                                    if os.path.isfile(fg_p):
+                                        fg_im = imread_unicode(fg_p, cv2.IMREAD_COLOR)
+                                        if fg_im is not None:
+                                            fg_f = fg_im[:, :, ::-1].astype(np.float32) * (1.0 / 255.0)
+                                            chk = cu.make_checkerboard(a_sm.shape[0], a_sm.shape[1])
+                                            a3_sm = a_sm[:, :, np.newaxis]
+                                            cmp_rgb = fg_f * a3_sm + chk * (1.0 - a3_sm)
+                                            imwrite_unicode(
+                                                os.path.join(comp_dir, mf),
+                                                (np.clip(cmp_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)[:, :, ::-1],
+                                            )
 
             processed_count = len(results)
             return self._finalize_inference(
@@ -802,12 +1047,21 @@ class InferenceMixin(ParallelInferenceMixin):
                         mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
 
                     t_frame = time.monotonic()
+                    if not hasattr(engine, "process_frame"):
+                        raise CorridorKeyError(
+                            "Legacy frame-by-frame engine is unavailable; CorridorKey 2.0 weights "
+                            "(corridorkey_v2.safetensors) are required."
+                        )
                     with self._gpu_lock:
                         res = engine.process_frame(
                             img, mask,
                             input_is_linear=is_linear,
                             fg_is_straight=True,
-                            despill_strength=params.despill_strength,
+                            despill_strength=(
+                                params.despill_strength
+                                if getattr(params, "despill_enabled", True)
+                                else 0.0
+                            ),
                             auto_despeckle=params.auto_despeckle,
                             despeckle_size=params.despeckle_size,
                             despeckle_dilation=params.despeckle_dilation,
@@ -918,147 +1172,258 @@ class InferenceMixin(ParallelInferenceMixin):
         job: Optional[GPUJob] = None,
         on_status: Optional[Callable[[str], None]] = None,
     ) -> Optional[dict]:
-        """Reprocess a single frame with current params.
+        """Run or re-postprocess a single frame in memory for Live Render preview.
 
-        Returns the result dict (fg, alpha, comp, processed) or None.
-        Does NOT write to disk — returns in-memory results for preview.
+        Never writes any outputs to disk. Uses a 2-tier cache:
+          1. Caches raw CorridorKey 2.0 GPU predictions (`alpha_raw`, `fg_raw`, `fg_linear`)
+             keyed by clip/frame/hint/linear/model_scale settings in `self._live_raw_cache`
+             so pure despill / despeckle / erode / blur slider tweaks update on CPU in ~15ms.
+          2. Falls cleanly into `infer_single_frame()` on GPU/CPU for RAW/unrendered clips.
         """
+        from corridorkey import color_utils as cu
         from . import read_image_frame
 
-        # Resolve "auto" screen color
         if params.screen_color == "auto":
             from .core import InferenceParams
             resolved = self._resolve_screen_color(clip)
             params = InferenceParams(**{**params.to_dict(), "screen_color": resolved})
 
-        t_start = time.monotonic()
         if clip.input_asset is None:
             return None
-
-        # Try fast disk-cached preview with updated despill
-        input_stem = f"{frame_index:05d}"
-        if clip.input_asset.asset_type == 'sequence':
-            input_files = clip.input_asset.get_frame_files()
-            if frame_index < len(input_files):
-                input_stem = os.path.splitext(input_files[frame_index])[0]
-
-        comp_path = os.path.join(clip.output_dir, "Comp", f"{input_stem}.png")
-        if not os.path.isfile(comp_path):
-            comp_path = os.path.join(clip.output_dir, "Comp", f"frame_{frame_index:06d}.png")
-        fg_path = os.path.join(clip.output_dir, "FG", f"{input_stem}.png")
-        if not os.path.isfile(fg_path):
-            fg_path = os.path.join(clip.output_dir, "FG", f"frame_{frame_index:06d}.png")
-        matte_path = os.path.join(clip.output_dir, "Matte", f"{input_stem}.png")
-        if not os.path.isfile(matte_path):
-            matte_path = os.path.join(clip.output_dir, "Matte", f"frame_{frame_index:06d}.png")
-
-        for ext in ("png", "exr"):
-            cand_fg = os.path.join(clip.output_dir, "FG", f"{input_stem}.{ext}")
-            cand_matte = os.path.join(clip.output_dir, "Matte", f"{input_stem}.{ext}")
-            if os.path.isfile(cand_fg):
-                fg_path = cand_fg
-            if os.path.isfile(cand_matte):
-                matte_path = cand_matte
-
-        if os.path.isfile(fg_path) and os.path.isfile(matte_path):
-            from backend.frame_io import imread_unicode
-            fg_img = imread_unicode(fg_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-            alpha_img = imread_unicode(matte_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-            if fg_img is not None and alpha_img is not None:
-                fg_f = fg_img.astype(np.float32) / (255.0 if fg_img.dtype == np.uint8 else 1.0)
-                fg_f = cv2.cvtColor(fg_f, cv2.COLOR_BGR2RGB)
-                if fg_path.lower().endswith(".exr"):
-                    from corridorkey import color_utils as _cu
-                    fg_f = np.clip(_cu.linear_to_srgb(np.maximum(fg_f, 0.0)), 0.0, 1.0)
-                alpha_2d = alpha_img.astype(np.float32) / (255.0 if alpha_img.dtype == np.uint8 else 1.0)
-                if alpha_2d.ndim == 3:
-                    alpha_2d = alpha_2d[:, :, 0]
-                hint_mask = None
-                if int(getattr(params, "garbage_matte_px", 0)) > 0 and clip.alpha_asset is not None and clip.alpha_asset.asset_type == "sequence":
-                    for af in clip.alpha_asset.get_frame_files():
-                        if os.path.splitext(af)[0] == input_stem:
-                            hint_mask = imread_unicode(os.path.join(clip.alpha_asset.path, af), cv2.IMREAD_GRAYSCALE)
-                            break
-                alpha_2d = self._postprocess_alpha_v2(alpha_2d, params, hint_mask_u8=hint_mask)
-                alpha_f = alpha_2d[:, :, np.newaxis]
-                from corridorkey import color_utils as cu
-                fg_despill = cu.despill(fg_f, strength=params.despill_strength, screen_color=params.screen_color)
-                checker = cu.make_checkerboard(fg_f.shape[0], fg_f.shape[1])
-                comp = fg_despill * alpha_f + checker * (1.0 - alpha_f)
-                fg_lin = cu.srgb_to_linear(np.clip(fg_despill, 0.0, 1.0))
-                processed_rgba = np.concatenate([fg_lin * alpha_f, alpha_f], axis=-1)
-                return {
-                    'fg': fg_despill,
-                    'alpha': alpha_f,
-                    'comp': comp,
-                    'processed': processed_rgba,
-                }
-
-        if clip.alpha_asset is None:
-            return None
-
         if job and job.is_cancelled:
             return None
 
-        with self._gpu_lock:
-            engines = self._get_engine_pool(on_status=on_status,
-                                            screen_color=params.screen_color)
-            engine = engines[0]
-
-        # Read the specific input frame
-        is_linear = params.input_is_linear
-        input_stem = f"{frame_index:05d}"
-        if clip.input_asset.asset_type == 'video':
-            img = read_video_frame_at(clip.input_asset.path, frame_index)
-        else:
+        # Locate exact input stem and resolve optional hint mask (alpha_asset -> mask_asset -> standalone)
+        input_stem = f"frame_{frame_index:06d}"
+        input_path = None
+        if clip.input_asset.asset_type == "sequence":
             input_files = clip.input_asset.get_frame_files()
-            if frame_index >= len(input_files):
+            if frame_index < 0 or frame_index >= len(input_files):
                 return None
-            fpath = os.path.join(clip.input_asset.path, input_files[frame_index])
             input_stem = os.path.splitext(input_files[frame_index])[0]
-            img = read_image_frame(fpath)
-        if img is None:
-            return None
+            input_path = os.path.join(clip.input_asset.path, input_files[frame_index])
 
-        # Read the specific alpha frame
-        if clip.alpha_asset.asset_type == 'video':
-            mask = read_video_mask_at(clip.alpha_asset.path, frame_index)
+        hint_mask = None
+        hint_sig: tuple = ("none",)
+        use_hint = bool(getattr(params, "use_hint", True))
+        hint_source = str(getattr(params, "hint_source", "auto") or "auto")
+        if use_hint:
+            hint_asset = None
+            if hint_source == "sam" and clip.mask_asset is not None:
+                hint_asset = clip.mask_asset
+            elif hint_source in ("birefnet", "gvm", "matanyone2", "chroma", "imported", "applevision") and clip.alpha_asset is not None:
+                hint_asset = clip.alpha_asset
+            else:
+                hint_asset = clip.alpha_asset or clip.mask_asset
+
+            if hint_asset is not None:
+                if hint_asset.asset_type == "video":
+                    hint_mask = read_video_mask_at(hint_asset.path, frame_index)
+                    try:
+                        st = os.stat(hint_asset.path)
+                        hint_sig = ("video", hint_asset.path, int(st.st_mtime_ns), frame_index)
+                    except OSError:
+                        hint_sig = ("video", hint_asset.path, frame_index)
+                else:
+                    hfiles = hint_asset.get_frame_files()
+                    if hfiles:
+                        lookup = {os.path.splitext(fn)[0]: fn for fn in hfiles}
+                        chosen = lookup.get(input_stem)
+                        if chosen is None and len(hfiles) == 1:
+                            chosen = hfiles[0]
+                        elif chosen is None and frame_index < len(hfiles):
+                            chosen = hfiles[frame_index]
+                        if chosen is not None:
+                            hpath = os.path.join(hint_asset.path, chosen)
+                            hint_mask = self._read_alpha_frame(
+                                clip,
+                                frame_index,
+                                hfiles,
+                                None,
+                                input_stem=input_stem,
+                                alpha_stem_lookup=lookup,
+                                alpha_dir=hint_asset.path,
+                            )
+                            try:
+                                st = os.stat(hpath)
+                                hint_sig = ("seq", hpath, int(st.st_mtime_ns))
+                            except OSError:
+                                hint_sig = ("seq", hpath)
+
+        model_cache_key = (
+            clip.root_path,
+            int(frame_index),
+            use_hint and (hint_mask is not None),
+            hint_source,
+            hint_sig,
+            bool(getattr(params, "input_is_linear", False)),
+            round(float(getattr(params, "model_scale", 1.0)), 3),
+            round(float(getattr(params, "hint_quality", 0.95)), 3),
+            round(float(getattr(params, "linear_brightness", 1.0)), 3),
+            round(float(getattr(params, "linear_contrast", 1.0)), 3),
+            round(float(getattr(params, "linear_contrast_pivot", 0.18)), 3),
+            bool(getattr(params, "auto_roi_crop", False)),
+            int(getattr(params, "auto_roi_pad_px", 96)),
+            bool(getattr(params, "color_mgmt_enabled", False)),
+            str(getattr(params, "input_log_profile", "none") or "none"),
+        )
+
+        cache = getattr(self, "_live_raw_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
+            self._live_raw_cache = cache
+
+        cached = cache.get(model_cache_key)
+        if cached is not None:
+            cache.move_to_end(model_cache_key)
+            alpha_raw, fg_raw, fg_linear = cached
         else:
-            alpha_files = clip.alpha_asset.get_frame_files()
-            alpha_stem_lookup = {os.path.splitext(fname)[0]: fname for fname in alpha_files}
-            mask = self._read_alpha_frame(
-                clip,
-                frame_index,
-                alpha_files,
-                None,
-                input_stem=input_stem,
-                alpha_stem_lookup=alpha_stem_lookup,
-            )
-        if mask is None:
-            return None
+            if clip.input_asset.asset_type == "video":
+                frame_rgb = read_video_frame_at(clip.input_asset.path, frame_index)
+            else:
+                if input_path is None:
+                    return None
+                frame_rgb = read_image_frame(input_path)
+            if frame_rgb is None:
+                return None
 
-        if mask.shape[:2] != img.shape[:2]:
-            mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+            is_lin_param = bool(getattr(params, "input_is_linear", False))
+            if (
+                bool(getattr(params, "color_mgmt_enabled", False))
+                and str(getattr(params, "input_log_profile", "none") or "none") != "none"
+            ):
+                from backend.color_management import log_to_linear
+                f_norm = (
+                    frame_rgb.astype(np.float32) * (1.0 / 255.0)
+                    if frame_rgb.dtype == np.uint8
+                    else frame_rgb.astype(np.float32, copy=False)
+                )
+                frame_rgb = log_to_linear(f_norm, params.input_log_profile)
+                is_lin_param = True
+
+            if hint_mask is not None and hint_mask.shape[:2] != frame_rgb.shape[:2]:
+                hint_mask = cv2.resize(
+                    hint_mask, (frame_rgb.shape[1], frame_rgb.shape[0]), interpolation=cv2.INTER_LINEAR
+                )
+
+            if job and job.is_cancelled:
+                return None
+
+            with self._gpu_lock:
+                if job and job.is_cancelled:
+                    return None
+                engines = self._get_engine_pool(on_status=on_status, screen_color=params.screen_color)
+                model = engines[0]
+
+                from corridorkey.runtime import infer_single_frame
+                if on_status:
+                    on_status(f"Live Render: frame {frame_index + 1}...")
+                raw_out = infer_single_frame(
+                    model,
+                    frame_rgb,
+                    is_linear=is_lin_param,
+                    hint_mask=hint_mask,
+                    hint_quality=float(getattr(params, "hint_quality", 0.95)),
+                    model_scale=float(getattr(params, "model_scale", 1.0)),
+                    linear_brightness=float(getattr(params, "linear_brightness", 1.0)),
+                    linear_contrast=float(getattr(params, "linear_contrast", 1.0)),
+                    linear_contrast_pivot=float(getattr(params, "linear_contrast_pivot", 0.18)),
+                    low_vram=bool(getattr(params, "low_vram", False)),
+                    auto_roi_crop=bool(getattr(params, "auto_roi_crop", False)),
+                    auto_roi_pad_px=int(getattr(params, "auto_roi_pad_px", 96)),
+                )
+
+            alpha_raw = raw_out["alpha_raw"]
+            fg_raw = raw_out["fg_raw"]
+            fg_linear = raw_out["fg_linear"]
+
+            cache[model_cache_key] = (alpha_raw, fg_raw, fg_linear)
+            cache.move_to_end(model_cache_key)
+            while len(cache) > 4:
+                cache.popitem(last=False)
 
         if job and job.is_cancelled:
             return None
 
-        with self._gpu_lock:
-            res = engine.process_frame(
-                img, mask,
-                input_is_linear=is_linear,
-                fg_is_straight=True,
-                despill_strength=params.despill_strength,
-                auto_despeckle=params.auto_despeckle,
-                despeckle_size=params.despeckle_size,
-                despeckle_dilation=params.despeckle_dilation,
-                despeckle_blur=params.despeckle_blur,
-                refiner_scale=params.refiner_scale,
-                source_passthrough=params.source_passthrough,
-                edge_erode_px=params.edge_erode_px,
-                edge_blur_px=params.edge_blur_px,
-                screen_color=params.screen_color,
-                garbage_matte_px=params.garbage_matte_px,
+        # Apply lightweight CPU alpha cleanup & despill on copies (never mutating cache)
+        hint_mask_u8 = None
+        if hint_mask is not None:
+            hint_mask_u8 = (
+                hint_mask
+                if hint_mask.dtype == np.uint8
+                else np.clip(hint_mask * 255.0, 0, 255).astype(np.uint8)
             )
-        logger.debug(f"Clip '{clip.name}' frame {frame_index}: reprocess {time.monotonic() - t_start:.3f}s")
-        return res
+        from backend.matte_shapes import PolygonMatteModel
+        polygon_shapes = PolygonMatteModel.load_from_clip(clip.root_path).shapes
+        clean_plate_rgb = self._load_clean_plate_rgb(params)
+        frame_rgb_cp = None
+        if clean_plate_rgb is not None:
+            cp_raw = (
+                read_video_frame_at(clip.input_asset.path, frame_index)
+                if clip.input_asset.asset_type == "video"
+                else (read_image_frame(input_path) if input_path else None)
+            )
+            if cp_raw is not None:
+                frame_rgb_cp = (
+                    cp_raw.astype(np.float32) * (1.0 / 255.0)
+                    if cp_raw.dtype == np.uint8
+                    else np.clip(cp_raw.astype(np.float32), 0.0, 1.0)
+                )
+        alpha_2d = self._postprocess_alpha_v2(
+            alpha_raw.copy(),
+            params,
+            hint_mask_u8=hint_mask_u8,
+            polygon_shapes=polygon_shapes,
+            frame_index=frame_index,
+            clean_plate_rgb=clean_plate_rgb,
+            frame_rgb_f32=frame_rgb_cp,
+        )
+        alpha_f = alpha_2d[:, :, np.newaxis]
+
+        checker = cu.make_checkerboard(alpha_2d.shape[0], alpha_2d.shape[1])
+        eff_despill = (
+            float(getattr(params, "despill_strength", 0.5))
+            if bool(getattr(params, "despill_enabled", True))
+            else 0.0
+        )
+        if bool(getattr(params, "advanced_despill_enabled", False)):
+            from backend.keying_post import advanced_despill, apply_edge_extend, apply_light_wrap
+            if eff_despill > 0.0:
+                fg_despill = advanced_despill(
+                    fg_raw.copy(),
+                    strength=eff_despill,
+                    screen_color=params.screen_color,
+                    mode=str(getattr(params, "despill_mode", "average") or "average"),
+                    luma_restore=float(getattr(params, "despill_luma_restore", 0.0) or 0.0),
+                )
+            else:
+                fg_despill = fg_raw.copy()
+            fg_despill = apply_edge_extend(
+                fg_despill, alpha_2d, int(getattr(params, "edge_extend_px", 0) or 0)
+            )
+            fg_despill = apply_light_wrap(
+                fg_despill,
+                checker,
+                alpha_2d,
+                strength=float(getattr(params, "light_wrap_strength", 0.0) or 0.0),
+                radius_px=int(getattr(params, "light_wrap_radius", 12) or 12),
+            )
+        elif eff_despill > 0.0:
+            fg_despill = cu.despill(
+                fg_raw.copy(),
+                strength=eff_despill,
+                screen_color=params.screen_color,
+            )
+        else:
+            fg_despill = fg_raw.copy()
+        comp = fg_despill * alpha_f + checker * (1.0 - alpha_f)
+        fg_lin = cu.srgb_to_linear(np.clip(fg_despill, 0.0, 1.0))
+        processed_rgba = np.concatenate([fg_lin * alpha_f, alpha_f], axis=-1)
+        return {
+            "fg": fg_despill,
+            "alpha": alpha_f,
+            "comp": comp,
+            "processed": processed_rgba,
+            "clip_root": clip.root_path,
+            "frame_index": int(frame_index),
+        }

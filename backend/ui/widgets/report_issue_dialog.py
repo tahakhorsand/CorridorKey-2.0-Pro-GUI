@@ -33,7 +33,12 @@ _MAX_URL_LENGTH = 7500  # stay well under 8192 to avoid 414 errors
 
 
 def _get_app_version() -> str:
-    """Read app version from pyproject.toml (single source of truth)."""
+    """Return central app version (with pyproject.toml fallback)."""
+    try:
+        from backend import APP_VERSION
+        return APP_VERSION
+    except Exception:
+        pass
     import tomllib
     candidates = []
     if getattr(sys, 'frozen', False):
@@ -47,7 +52,7 @@ def _get_app_version() -> str:
                 return tomllib.load(f)["project"]["version"]
         except Exception:
             continue
-    return "unknown"
+    return "2.0.0"
 
 
 def _detect_install_method() -> str:
@@ -99,7 +104,7 @@ def _detect_install_method() -> str:
         probe = parent
     # No .git directory in any ancestor. The overwhelmingly common way
     # to end up here is the user downloading the GitHub source .zip (or
-    # a release source tarball) and running 1-install.bat against it.
+    # a release source tarball) and running install.bat against it.
     # Flag it as such so triage can recommend switching to a git clone,
     # where the updater uses a clean git pull instead of the robocopy
     # fallback in 3-update.bat/sh.

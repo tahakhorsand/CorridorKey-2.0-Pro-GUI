@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class WorkerMixin:
     """GPU worker signal handlers for MainWindow."""
 
-    @Slot(str, str, int, int)
+    @Slot(str, str, int, int, float)
     def _on_worker_progress(self, job_id: str, clip_name: str, current: int, total: int, fps: float = 0.0) -> None:
         if self._cancel_requested_job_id == job_id:
             self._queue_panel.refresh()
@@ -83,10 +83,18 @@ class WorkerMixin:
         """
         if self._cancel_requested_job_id == job_id:
             return
+        job = self._service.job_queue.find_job_by_id(job_id)
+        if job is not None and job.job_type in (JobType.PREVIEW_REPROCESS, JobType.SAM3_PREVIEW):
+            if self._active_job_id is None:
+                self._status_bar.set_message(message)
+            return
         if self._active_job_id is None:
             self._active_job_id = job_id
         from ui.state_labels import backend_status_text
-        self._status_bar.set_phase(backend_status_text(message))
+        phase_text = backend_status_text(message)
+        self._status_bar.set_phase(phase_text)
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.set_busy(True, phase_text)
 
     @Slot(str, str, int, str)
     def _on_worker_preview(self, job_id: str, clip_name: str, frame_index: int, path: str) -> None:
@@ -94,12 +102,16 @@ class WorkerMixin:
             return
         # Only update preview if this is the active job
         if job_id == self._active_job_id:
+            if hasattr(self, "_dual_viewer"):
+                self._dual_viewer.set_busy(False)
             self._dual_viewer.load_preview_from_file(path, clip_name, frame_index)
 
     @Slot(str, str, str)
     def _on_worker_clip_finished(self, job_id: str, clip_name: str, job_type: str) -> None:
         self._force_stop_armed = False
         self._status_bar.set_stop_button_mode(force=False)
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.set_busy(False)
         # Map job type to correct next state.
         if job_type == JobType.SAM3_TRACK.value:
             target_state = ClipState.MASKED
@@ -232,6 +244,14 @@ class WorkerMixin:
         # If selected clip, reload preview to show new assets
         if self._current_clip and self._current_clip.name == clip_name:
             self._sync_selected_clip_view(self._current_clip)
+            if job_type in (
+                JobType.BIREFNET_ALPHA.value,
+                JobType.CHROMA_KEY_ALPHA.value,
+                JobType.APPLEVISION_ALPHA.value,
+            ):
+                from ui.preview.frame_index import ViewMode
+                self._dual_viewer.output_viewer.set_view_mode(ViewMode.ALPHA.value)
+                self._dual_viewer.output_viewer.refresh_current_frame()
             self._refresh_button_state()
             _alpha_gen_ok = self._current_clip.state in (
                 ClipState.RAW, ClipState.MASKED, ClipState.READY, ClipState.COMPLETE
@@ -250,6 +270,14 @@ class WorkerMixin:
 
     @Slot(str, str)
     def _on_worker_warning(self, job_id: str, message: str) -> None:
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_live_render_busy(False)
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.set_busy(False)
+        if message.startswith("Preview skipped"):
+            self._status_bar.set_message(message)
+            logger.warning("Preview warning: %s", message)
+            return
         if message.startswith("Cancelled:"):
             self._cancel_requested_job_id = None
             self._active_job_id = None
@@ -280,6 +308,10 @@ class WorkerMixin:
 
     @Slot(str, str, str)
     def _on_worker_error(self, job_id: str, clip_name: str, error_msg: str) -> None:
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_live_render_busy(False)
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.set_busy(False)
         if self._cancel_requested_job_id == job_id:
             self._cancel_requested_job_id = None
             self._active_job_id = None
@@ -326,6 +358,10 @@ class WorkerMixin:
 
     @Slot()
     def _on_queue_empty(self) -> None:
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_live_render_busy(False)
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.set_busy(False)
         if self._service.job_queue.has_pending:
             return
         self._cancel_requested_job_id = None
@@ -342,3 +378,34 @@ class WorkerMixin:
         # engine that live preview depends on.  Model switching is already
         # handled by _ensure_model() when a different model type is needed.
         logger.info("All jobs completed, queue idle")
+        self._execute_post_queue_action()
+
+    def _on_queue_pause_toggled(self, paused: bool) -> None:
+        if paused:
+            self._service.job_queue.pause()
+            if hasattr(self, "_status_bar"):
+                self._status_bar.set_message("Queue paused after current job")
+        else:
+            self._service.job_queue.resume()
+            if hasattr(self, "_gpu_worker"):
+                self._gpu_worker.wake()
+            if hasattr(self, "_status_bar"):
+                self._status_bar.set_message("Queue resumed")
+
+    def _execute_post_queue_action(self) -> None:
+        if not hasattr(self, "_queue_panel"):
+            return
+        action = self._queue_panel.after_queue_action()
+        if action == "beep":
+            from PySide6.QtWidgets import QApplication
+            QApplication.beep()
+        elif action == "open_folder":
+            clip = getattr(self, "_current_clip", None)
+            target_dir = getattr(clip, "output_dir", None) or getattr(self, "_clips_dir", "")
+            if target_dir and os.path.isdir(target_dir):
+                from PySide6.QtCore import QUrl
+                from PySide6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(QUrl.fromLocalFile(target_dir))
+        elif action == "close_app":
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(500, self.close)

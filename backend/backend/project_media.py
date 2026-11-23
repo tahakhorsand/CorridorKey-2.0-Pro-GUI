@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # keyword -> destination folder/file name at clip root
 _KEYWORD_DEST_MAP = {
     "alphahint": "AlphaHint",
-    "maskhint": "VideoMamaMaskHint",
+    "maskhint": "SamMaskHint",
 }
 
 
@@ -41,7 +41,7 @@ def _copy_companion_hint_sequences(
     Scans siblings for entries named ``{source_stem}_{keyword}`` (case
     insensitive). Supports both folder-of-frames and video files:
     ☼ ``MyClip_AlphaHint/`` or ``MyClip_AlphaHint.mov`` -> AlphaHint/ or AlphaHint.mov
-    ☼ ``MyClip_MaskHint/``  or ``MyClip_MaskHint.mov``  -> VideoMamaMaskHint/ or VideoMamaMaskHint.mov
+    ☼ ``MyClip_MaskHint/``  or ``MyClip_MaskHint.mov``  -> SamMaskHint/ or SamMaskHint.mov
 
     The hint entry must contain both the keyword and the source folder's stem
     so that ``Shot01_AlphaHint/`` matches ``Shot01/`` but not ``Shot02/``.
@@ -68,8 +68,8 @@ def _copy_companion_hint_sequences(
             check = entry_lower if os.path.isdir(entry_path) else entry_stem
             if keyword not in check:
                 continue
-            # Must also contain the source stem
-            if source_stem not in check:
+            # Must also contain the source stem at a token boundary
+            if not re.search(rf"(?:^|[\s_\-.]){re.escape(source_stem)}(?:$|[\s_\-.])", check):
                 continue
 
             if os.path.isdir(entry_path):
@@ -191,7 +191,7 @@ def create_clip_from_sequence(
     if copy_source:
         frames_dir = os.path.join(clip_dir, "Frames")
         os.makedirs(frames_dir, exist_ok=True)
-        files_to_copy = specific_files or [
+        files_to_copy = [os.path.basename(f) for f in specific_files] if specific_files else [
             f for f in os.listdir(source_folder)
             if os.path.isfile(os.path.join(source_folder, f)) and is_image_file(f)
         ]

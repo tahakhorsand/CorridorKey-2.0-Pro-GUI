@@ -10,6 +10,7 @@ import gc
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -22,10 +23,32 @@ from .pipelines import PipelinesMixin
 
 logger = logging.getLogger(__name__)
 
+_torch_lock = threading.Lock()
+_torch_configured = False
+
+
+def configure_torch_runtime() -> None:
+    """Apply CUDA / cuDNN runtime globals lazily when torch is first needed."""
+    global _torch_configured
+    if _torch_configured:
+        return
+    with _torch_lock:
+        if _torch_configured:
+            return
+        try:
+            import torch
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cudnn.benchmark = False
+            logger.info("CUDA globals: TF32 precision='high', cuDNN benchmark=off")
+        except ImportError:
+            pass
+        _torch_configured = True
+
 # CorridorKey 2.0 Defaults
 _D = {
     "use_hint": True,
     "hint_source": "auto",
+    "despill_enabled": True,
     "despill_strength": 0.5,
     "auto_despeckle": False,
     "despeckle_size": 20,
@@ -50,6 +73,7 @@ class InferenceParams:
     input_is_linear: bool = False
     frame_dir_linear: bool = False
     cutout_linear: bool = False
+    despill_enabled: bool = True
     despill_strength: float = 0.5
     screen_color: str = "green"
     auto_vram: bool = True
@@ -79,6 +103,40 @@ class InferenceParams:
     edge_erode_px: int = 0
     edge_blur_px: int = 0
     garbage_matte_px: int = 0
+    # Alpha Levels (clip black/white & midtone gamma)
+    alpha_clip_black: float = 0.0
+    alpha_clip_white: float = 1.0
+    alpha_gamma: float = 1.0
+    # Auto-ROI crop around subject hint during single-frame live inference
+    auto_roi_crop: bool = False
+    auto_roi_pad_px: int = 96
+    # Export codec / deliverable format ("h264", "prores_4444", "prores_422hq", "png_seq", "exr")
+    export_codec: str = "h264"
+    # Optional Pro Color Management (explicit opt-in toggles, off by default)
+    color_mgmt_enabled: bool = False
+    input_log_profile: str = "none"
+    display_lut_enabled: bool = False
+    display_lut_path: str = ""
+    # Optional Temporal Alpha Deflicker (explicit opt-in toggle, off by default)
+    temporal_deflicker_enabled: bool = False
+    temporal_deflicker_strength: float = 0.35
+    temporal_deflicker_radius: int = 1
+    # Optional Advanced Despill & Edge Treatment (explicit opt-in toggle, off by default)
+    advanced_despill_enabled: bool = False
+    despill_mode: str = "average"
+    despill_luma_restore: float = 0.0
+    edge_extend_px: int = 0
+    light_wrap_strength: float = 0.0
+    light_wrap_radius: int = 12
+    # Optional Clean Plate / IBK Difference (explicit opt-in toggle, off by default)
+    clean_plate_enabled: bool = False
+    clean_plate_path: str = ""
+    clean_plate_strength: float = 0.5
+
+    @property
+    def effective_despill_strength(self) -> float:
+        """Return active despill strength, or 0.0 when Despill is disabled."""
+        return float(self.despill_strength) if self.despill_enabled else 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -103,6 +161,7 @@ class OutputConfig:
     cutout_enabled: bool = True
     cutout_format: str = "mov"
     output_format: str = "video"  # "video" or "exr"
+    export_codec: str = "h264"    # "h264", "prores_4444", "prores_422hq", "png_seq", "exr"
     exr_dtype: str = "half"       # "half" or "float"
     exr_compression: str = "dwab"
 
@@ -164,12 +223,14 @@ class CorridorKeyService(
         self._device: str = "cpu"
         self._job_queue: Optional[GPUJobQueue] = None
         self._sam3_model_id: str = "sam3.1-INT8-ConvRot"
-        self._gpu_lock = threading.Lock()
+        self._gpu_lock = threading.RLock()
         self._inference_active: int = 0
         self._switch_pending: bool = False
         self._gate_lock = threading.Lock()
+        self._gate_cond = threading.Condition(self._gate_lock)
         self._inference_idle = threading.Event()
         self._inference_idle.set()
+        self._live_raw_cache: OrderedDict[tuple, tuple[np.ndarray, np.ndarray, np.ndarray]] = OrderedDict()
 
     @property
     def job_queue(self) -> GPUJobQueue:
@@ -189,12 +250,13 @@ class CorridorKeyService(
             return
         logger.info("SAM 3.1 model preference changed: %s -> %s", self._sam3_model_id, model_id)
         self._sam3_model_id = model_id
-        if self._sam3_tracker is not None:
-            self._safe_offload(self._sam3_tracker)
-            self._sam3_tracker = None
-            if self._active_model == _ActiveModel.SAM3:
-                self._active_model = _ActiveModel.NONE
-            self.release_vram(keep_corridorkey_cpu_cache=True)
+        with self._gpu_lock:
+            if self._sam3_tracker is not None:
+                self._safe_offload(self._sam3_tracker)
+                self._sam3_tracker = None
+                if self._active_model == _ActiveModel.SAM3:
+                    self._active_model = _ActiveModel.NONE
+                self.release_vram(keep_corridorkey_cpu_cache=True)
 
     @property
     def model_resolution(self) -> int:
@@ -220,20 +282,22 @@ class CorridorKeyService(
         self._pool_size = max(1, n)
 
     def _begin_inference(self) -> None:
-        with self._gate_lock:
+        with self._gate_cond:
+            while self._switch_pending:
+                self._gate_cond.wait(timeout=1.0)
             self._inference_active += 1
             self._inference_idle.clear()
-        while self._switch_pending:
-            time.sleep(0.05)
 
     def _end_inference(self) -> None:
-        with self._gate_lock:
+        with self._gate_cond:
             self._inference_active -= 1
             if self._inference_active <= 0:
                 self._inference_active = 0
                 self._inference_idle.set()
+                self._gate_cond.notify_all()
 
     def detect_device(self) -> str:
+        configure_torch_runtime()
         try:
             import torch
             if torch.cuda.is_available():

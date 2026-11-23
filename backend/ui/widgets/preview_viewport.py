@@ -80,7 +80,21 @@ class PreviewViewport(QWidget):
 
     frame_changed = Signal(int)  # current stem index
 
+    frame_updated = Signal()  # emitted whenever displayed QImage updates
+
     view_mode_changed = Signal(str)
+
+    backdrop_changed = Signal(str)
+
+    custom_plate_requested = Signal()
+
+    pixel_hovered = Signal(int, int, int, int, int, float)
+
+    polygon_completed = Signal(str, object)
+
+    polygon_vertex_moved = Signal(str, int, int, float, float)
+
+    mask_paint_stroke = Signal(int, str, object, float)
 
 
 
@@ -107,6 +121,12 @@ class PreviewViewport(QWidget):
         self._locked_mode: ViewMode | None = None
 
         self._input_exr_is_linear: bool = False
+
+        self._backdrop: str = "checker"
+
+        self._live_preview_stem_idx: int | None = None
+
+        self._live_extra_modes: set[ViewMode] = set()
 
 
 
@@ -147,6 +167,12 @@ class PreviewViewport(QWidget):
         self._mode_bar = ViewModeBar()
 
         self._mode_bar.mode_changed.connect(self._on_mode_changed)
+
+        self._mode_bar.backdrop_changed.connect(self._on_backdrop_changed)
+
+        self._mode_bar.custom_plate_requested.connect(self.custom_plate_requested.emit)
+
+        self._mode_bar.inspect_mode_changed.connect(self._on_inspect_mode_changed)
 
         top_bar.addWidget(self._mode_bar)
 
@@ -191,6 +217,14 @@ class PreviewViewport(QWidget):
         self._split_view = SplitViewWidget()
 
         self._split_view.zoom_changed.connect(self._on_zoom_changed)
+
+        self._split_view.pixel_hovered.connect(self.pixel_hovered.emit)
+
+        self._split_view.polygon_completed.connect(self.polygon_completed.emit)
+
+        self._split_view.polygon_vertex_moved.connect(self.polygon_vertex_moved.emit)
+
+        self._split_view.mask_paint_stroke.connect(self.mask_paint_stroke.emit)
 
         self._split_view.set_annotation_model(self._annotation_model)
 
@@ -332,9 +366,25 @@ class PreviewViewport(QWidget):
 
     def set_annotation_mode(self, mode: str | None) -> None:
 
-        """Set annotation mode: 'fg', 'bg', or None to disable."""
+        """Set annotation mode: 'fg', 'bg', 'poly_*', 'mask_paint_*', or None to disable."""
 
         self._split_view.set_annotation_mode(mode)
+
+    def set_active_object_id(self, object_id: int) -> None:
+
+        self._split_view.set_active_object_id(object_id)
+
+    def set_polygon_model(self, model) -> None:
+
+        self._split_view.set_polygon_model(model)
+
+    def set_alpha_probe_array(self, alpha_arr) -> None:
+
+        self._split_view.set_alpha_probe_array(alpha_arr)
+
+    def _on_inspect_mode_changed(self, mode: str) -> None:
+
+        self._split_view.set_inspect_mode(mode)
 
 
 
@@ -418,6 +468,13 @@ class PreviewViewport(QWidget):
 
         # Save annotations and holdout for previous clip before switching
 
+        same_clip = (
+            self._clip is not None
+            and clip is not None
+            and self._clip.root_path == clip.root_path
+        )
+        prev_stem = self._current_stem_idx
+
         if self._clip is not None:
 
             self._annotation_model.save(self._clip.root_path)
@@ -437,6 +494,12 @@ class PreviewViewport(QWidget):
         # auto-detected default before the user asked for it.
 
         clear_cache()
+
+        self._live_preview_stem_idx = None
+
+        self._live_extra_modes = set()
+
+        self._decoder.cancel_pending()
 
         self._annotation_model.load(clip.root_path)
 
@@ -514,7 +577,14 @@ class PreviewViewport(QWidget):
 
         if self._frame_index.frame_count > 0:
 
-            self._navigate_to(0)
+            if same_clip and prev_stem >= 0:
+                target_stem = max(0, min(prev_stem, self._frame_index.frame_count - 1))
+            elif clip.in_out_range is not None:
+                target_stem = max(0, min(int(clip.in_out_range.in_point), self._frame_index.frame_count - 1))
+            else:
+                target_stem = 0
+
+            self._navigate_to(target_stem)
 
         else:
 
@@ -560,7 +630,11 @@ class PreviewViewport(QWidget):
 
         if self._locked_mode is None:
 
-            self._mode_bar.set_available_modes(self._frame_index.available_modes())
+            available_set = set(self._frame_index.available_modes()) | self._live_extra_modes
+
+            available = [m for m in ViewMode if m in available_set]
+
+            self._mode_bar.set_available_modes(available)
 
             self._current_mode = self._mode_bar.current_mode()
 
@@ -686,7 +760,7 @@ class PreviewViewport(QWidget):
 
 
 
-        qimg = decode_frame(file_path, ViewMode.COMP)
+        qimg = decode_frame(file_path, ViewMode.COMP, backdrop=self._backdrop)
 
         if qimg:
 
@@ -838,6 +912,54 @@ class PreviewViewport(QWidget):
 
         return btn
 
+    def add_snap_button(self) -> QPushButton:
+
+        """Add a Freeze Snapshot (SNAP) button next to A/B wipe in the top bar."""
+
+        btn = QPushButton("SNAP")
+
+        btn.setCheckable(True)
+
+        btn.setFixedHeight(24)
+
+        btn.setFixedWidth(48)
+
+        btn.setToolTip(
+
+            self.tr(
+
+                "Freeze Snapshot A/B\n\n"
+
+                "Captures the current output frame as Side A in A/B wipe,\n"
+
+                "so you can tweak sliders live and wipe before (A) vs after (B)."
+
+            )
+
+        )
+
+        btn.setStyleSheet(
+
+            "QPushButton { background-color: #1A1900; color: #808070; "
+
+            "font-size: 10px; padding: 2px 6px; border: 1px solid #2A2910; "
+
+            "margin-right: 4px; }"
+
+            "QPushButton:checked { background-color: #06B6D4; color: #000000; "
+
+            "font-weight: 700; border: none; margin-right: 4px; }"
+
+            "QPushButton:hover { border-color: #454430; color: #E0E0E0; }"
+
+        )
+
+        self._top_bar.layout().addWidget(btn)
+
+        self._snap_button = btn
+
+        return btn
+
 
 
     def navigate_to_frame(self, stem_index: int) -> None:
@@ -898,9 +1020,53 @@ class PreviewViewport(QWidget):
 
 
 
+    def set_live_preview_modes(self, modes: set[ViewMode] | tuple[ViewMode, ...] | list[ViewMode]) -> None:
+
+        """Temporarily enable/disable live SAM 3.1 preview modes in the mode bar."""
+
+        new_modes = set(modes)
+
+        if new_modes == self._live_extra_modes:
+
+            return
+
+        self._live_extra_modes = new_modes
+
+        if self._locked_mode is None and self._frame_index is not None:
+
+            prev_mode = self._current_mode
+
+            available_set = set(self._frame_index.available_modes()) | self._live_extra_modes
+
+            available = [m for m in ViewMode if m in available_set]
+
+            self._mode_bar.set_available_modes(available)
+
+            if prev_mode in available_set and self._mode_bar.current_mode() != prev_mode:
+
+                self._mode_bar.set_mode(prev_mode, emit=False)
+
+            self._current_mode = self._mode_bar.current_mode()
+
+            self._push_stem_availability(self._current_stem_idx)
+
+
+
+    def clear_live_preview(self) -> None:
+
+        """Release the active live preview hold so async/cached frames can paint."""
+
+        self._live_preview_stem_idx = None
+
+
+
     def show_reprocess_preview(self, qimage: QImage) -> None:
 
         """Show a live reprocess result image in the viewport."""
+
+        self._live_preview_stem_idx = self._current_stem_idx
+
+        self._decoder.cancel_pending()
 
         if self._split_view.split_enabled:
 
@@ -909,6 +1075,18 @@ class PreviewViewport(QWidget):
         else:
 
             self._split_view.set_image(qimage)
+
+        self.frame_updated.emit()
+
+    def refresh_current_frame(self) -> None:
+
+        self.clear_live_preview()
+
+        if self._frame_index and self._current_stem_idx >= 0:
+
+            self._push_stem_availability(self._current_stem_idx)
+
+            self._request_frame(self._current_stem_idx, self._current_mode)
 
 
 
@@ -925,6 +1103,10 @@ class PreviewViewport(QWidget):
             return
 
         stem_index = min(stem_index, self._frame_index.frame_count - 1)
+
+        if self._live_preview_stem_idx is not None and self._live_preview_stem_idx != stem_index:
+
+            self._live_preview_stem_idx = None
 
         self._current_stem_idx = stem_index
 
@@ -989,6 +1171,8 @@ class PreviewViewport(QWidget):
             if self._frame_index.has_frame(mode, stem_index)
 
         }
+
+        present |= self._live_extra_modes
 
         self._mode_bar.set_current_stem_availability(present)
 
@@ -1056,11 +1240,14 @@ class PreviewViewport(QWidget):
 
         if path:
 
-            cached = get_cached_qimage(path, mode, self._input_exr_is_linear if mode == ViewMode.INPUT else False)
+            bd = self._backdrop if mode in (ViewMode.COMP, ViewMode.PROCESSED) else "checker"
+
+            cached = get_cached_qimage(path, mode, self._input_exr_is_linear if mode == ViewMode.INPUT else False, backdrop=bd)
 
             if cached is not None:
 
                 self._on_frame_decoded(stem_index, mode.value, cached)
+                self._prefetch_ahead(stem_index, mode)
 
                 return
 
@@ -1074,7 +1261,10 @@ class PreviewViewport(QWidget):
 
                 input_exr_is_linear=(self._input_exr_is_linear if mode == ViewMode.INPUT else False),
 
+                backdrop=bd,
+
             )
+            self._prefetch_ahead(stem_index, mode)
 
             return
 
@@ -1137,6 +1327,24 @@ class PreviewViewport(QWidget):
         )
 
 
+
+    def _prefetch_ahead(self, stem_index: int, mode: ViewMode, count: int = 8) -> None:
+        """Prefetch the next `count` image-sequence frames in parallel for smooth playback."""
+        if not self._frame_index or self._frame_index.is_video_mode(mode):
+            return
+        total = self._frame_index.frame_count
+        if total <= 1:
+            return
+        bd = self._backdrop if mode in (ViewMode.COMP, ViewMode.PROCESSED) else "checker"
+        is_lin = self._input_exr_is_linear if mode == ViewMode.INPUT else False
+        items: list[tuple[str, ViewMode, bool, str]] = []
+        for offset in range(1, min(count + 1, total)):
+            idx = (stem_index + offset) % total
+            p = self._frame_index.get_path(mode, idx)
+            if p:
+                items.append((p, mode, is_lin, bd))
+        if items:
+            self._decoder.prefetch_sequence(items)
 
     def _load_split_images(self) -> None:
 
@@ -1248,11 +1456,39 @@ class PreviewViewport(QWidget):
 
 
 
-        if self._current_stem_idx >= 0:
-
+        if (
+            self._current_stem_idx >= 0
+            and self._live_preview_stem_idx != self._current_stem_idx
+        ):
             self._request_frame(self._current_stem_idx, self._current_mode)
 
 
+
+    @property
+
+    def current_backdrop(self) -> str:
+
+        """Active compositing backdrop ('checker'|'black'|'white'|'gray'|'magenta')."""
+
+        return self._backdrop
+
+    @Slot(str)
+
+    def _on_backdrop_changed(self, backdrop: str) -> None:
+
+        """Handle compositing backdrop selection change."""
+
+        self._backdrop = (backdrop or "checker").lower()
+
+        self.backdrop_changed.emit(self._backdrop)
+
+        if self._live_preview_stem_idx is not None and self._current_stem_idx == self._live_preview_stem_idx:
+
+            return
+
+        if self._current_stem_idx >= 0 and self._current_mode in (ViewMode.COMP, ViewMode.PROCESSED):
+
+            self._request_frame(self._current_stem_idx, self._current_mode)
 
     @Slot(int)
 
@@ -1269,6 +1505,14 @@ class PreviewViewport(QWidget):
     def _on_frame_decoded(self, stem_index: int, mode_value: str, qimage: object) -> None:
 
         """Handle async decode completion — display the image."""
+
+        if self._current_stem_idx >= 0 and stem_index != self._current_stem_idx:
+
+            return
+
+        if self._live_preview_stem_idx is not None and stem_index == self._live_preview_stem_idx:
+
+            return
 
         if qimage is None:
 
@@ -1298,7 +1542,7 @@ class PreviewViewport(QWidget):
 
             self._split_view.set_image(qimage)
 
-
+        self.frame_updated.emit()
 
     @Slot(float)
 

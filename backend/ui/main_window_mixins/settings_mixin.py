@@ -267,6 +267,7 @@ class SettingsMixin:
             self.close()
 
             new_window = MainWindow(self._service, self._recent_store)
+            app._active_main_window = new_window
 
             new_window.setGeometry(geometry)
 
@@ -317,6 +318,9 @@ class SettingsMixin:
         dlg.setWindowTitle(_tr("Download Manager"))
 
         dlg.exec()
+
+        if hasattr(self, "_param_panel") and hasattr(self._param_panel, "refresh_birefnet_models"):
+            self._param_panel.refresh_birefnet_models()
 
 
 
@@ -496,17 +500,13 @@ class SettingsMixin:
 
         box.setText(
 
-            f'<h2><a href="https://www.ezcorridorkey.com" '
+            f'<h2 style="color: #FFF203;">'
 
-            f'style="color: #FFF203; text-decoration: none;">'
-
-            f'EZ<span style="color:{accent};">-</span>Corridor'
-
-            f'<span style="color:{accent};">Key</span></a>'
+            f'Corridor<span style="color:{accent};">Key</span> 2.0 Pro'
 
             f" v{app_version}</h2>"
 
-            "<p>" + _tr("AI Green Screen Keyer") + "<br>"
+            "<p>" + _tr("AI Green &amp; Blue Screen Keyer") + "<br>"
 
             '<a href="https://github.com/nikopueringer/CorridorKey#corridorkey-licensing-and-permissions">'
 
@@ -568,6 +568,16 @@ class SettingsMixin:
 
     def _get_local_version(self) -> str:
 
+        try:
+
+            from backend import APP_VERSION
+
+            return APP_VERSION
+
+        except Exception:
+
+            pass
+
         import tomllib
 
         candidates = []
@@ -576,11 +586,9 @@ class SettingsMixin:
 
             candidates.append(os.path.join(sys._MEIPASS, "pyproject.toml"))
 
-        candidates.append(
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "pyproject.toml")
-
-        )
+        candidates.append(os.path.join(repo_root, "pyproject.toml"))
 
         for path in candidates:
 
@@ -594,7 +602,7 @@ class SettingsMixin:
 
                 continue
 
-        return "0.0.0"
+        return "2.0.0"
 
 
 
@@ -606,7 +614,7 @@ class SettingsMixin:
 
 
 
-            repo_root = os.path.dirname(os.path.dirname(__file__))
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
             result = subprocess.run(
 
@@ -876,7 +884,7 @@ class SettingsMixin:
 
         import subprocess
 
-        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
         if os.name == "nt":
 
@@ -938,9 +946,9 @@ class SettingsMixin:
 
 
 
-        from PySide6.QtWidgets import QProgressDialog
+        from ui.widgets.orbital_spinner import OrbitalProgressDialog
 
-        progress = QProgressDialog(
+        progress = OrbitalProgressDialog(
 
             _tr("Downloading update..."), _tr("Cancel"), 0, 100, self
 
@@ -1030,13 +1038,13 @@ class SettingsMixin:
 
 
 
-            # Build versioned asset name: EZ-CorridorKey-{ver}-{Platform}-{arch}.{ext}
+            # Build versioned asset name: CorridorKey-{ver}-{Platform}-{arch}.{ext}
 
             tag = release.get("tag_name", "")
 
             ver = tag.lstrip("v") if tag else "unknown"
 
-            asset_name = f"EZ-CorridorKey-{ver}-{asset_platform}.{asset_ext}"
+            asset_name = f"CorridorKey-{ver}-{asset_platform}.{asset_ext}"
 
 
 

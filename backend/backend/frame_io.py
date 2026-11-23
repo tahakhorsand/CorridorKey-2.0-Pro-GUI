@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 from typing import Callable, Optional
 
 # Enable OpenEXR support in OpenCV before cv2 is imported.
@@ -101,8 +102,10 @@ def write_exr(path: str, img: np.ndarray, compression: str = "dwab") -> bool:
             header['channels'] = {'Y': HALF}
             y = img.astype(np.float16)
             out = OpenEXR.OutputFile(path, header)
-            out.writePixels({'Y': y.tobytes()})
-            out.close()
+            try:
+                out.writePixels({'Y': y.tobytes()})
+            finally:
+                out.close()
         elif img.ndim == 3 and img.shape[2] == 3:
             # BGR → R, G, B channels
             h, w = img.shape[:2]
@@ -113,8 +116,10 @@ def write_exr(path: str, img: np.ndarray, compression: str = "dwab") -> bool:
             g = img[:, :, 1].astype(np.float16)
             r = img[:, :, 2].astype(np.float16)
             out = OpenEXR.OutputFile(path, header)
-            out.writePixels({'R': r.tobytes(), 'G': g.tobytes(), 'B': b.tobytes()})
-            out.close()
+            try:
+                out.writePixels({'R': r.tobytes(), 'G': g.tobytes(), 'B': b.tobytes()})
+            finally:
+                out.close()
         elif img.ndim == 3 and img.shape[2] == 4:
             # BGRA → R, G, B, A channels
             h, w = img.shape[:2]
@@ -126,11 +131,13 @@ def write_exr(path: str, img: np.ndarray, compression: str = "dwab") -> bool:
             r = img[:, :, 2].astype(np.float16)
             a = img[:, :, 3].astype(np.float16)
             out = OpenEXR.OutputFile(path, header)
-            out.writePixels({
-                'R': r.tobytes(), 'G': g.tobytes(),
-                'B': b.tobytes(), 'A': a.tobytes(),
-            })
-            out.close()
+            try:
+                out.writePixels({
+                    'R': r.tobytes(), 'G': g.tobytes(),
+                    'B': b.tobytes(), 'A': a.tobytes(),
+                })
+            finally:
+                out.close()
         else:
             logger.warning(f"Unsupported image shape for EXR write: {img.shape}")
             return False
@@ -190,7 +197,9 @@ def imread_unicode(path: str, flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndar
 # older builds fail. When the plain open fails we stage the file at an ASCII
 # path. Staged hardlinks/copies are deduped per source and cleaned at exit.
 _stage_dir: Optional[str] = None
-_staged: dict[str, str] = {}
+_staged: dict[str, tuple[tuple[float, int] | None, str]] = {}
+_stage_lock = threading.Lock()
+_stage_counter = 0
 
 
 def _short_path_windows(path: str) -> Optional[str]:
@@ -227,23 +236,33 @@ def _stage_ascii(path: str) -> str:
 
     Returns the staged ASCII path, or the original path if staging fails.
     """
-    global _stage_dir
-    existing = _staged.get(path)
-    if existing and os.path.isfile(existing):
-        return existing
-    if _stage_dir is None:
-        _stage_dir = tempfile.mkdtemp(prefix="ck_uvid_")
-        atexit.register(_cleanup_staged)
-    dst = os.path.join(_stage_dir, f"v{len(_staged):04d}{os.path.splitext(path)[1]}")
+    global _stage_dir, _stage_counter
     try:
-        os.link(path, dst)  # cheap: no data copy on the same volume
+        st = os.stat(path)
+        sig: tuple[float, int] | None = (st.st_mtime, st.st_size)
     except OSError:
+        sig = None
+
+    with _stage_lock:
+        entry = _staged.get(path)
+        if entry is not None:
+            cached_sig, existing = entry
+            if cached_sig == sig and os.path.isfile(existing):
+                return existing
+        if _stage_dir is None:
+            _stage_dir = tempfile.mkdtemp(prefix="ck_uvid_")
+            atexit.register(_cleanup_staged)
+        _stage_counter += 1
+        dst = os.path.join(_stage_dir, f"v{_stage_counter:04d}{os.path.splitext(path)[1]}")
         try:
-            shutil.copy2(path, dst)
+            os.link(path, dst)  # cheap: no data copy on the same volume
         except OSError:
-            return path
-    _staged[path] = dst
-    return dst
+            try:
+                shutil.copy2(path, dst)
+            except OSError:
+                return path
+        _staged[path] = (sig, dst)
+        return dst
 
 
 def open_video(path: str) -> cv2.VideoCapture:
@@ -289,7 +308,15 @@ class _StagedVideoWriter:
         self._writer.write(frame)
 
     def release(self) -> None:
+        opened = self._writer.isOpened()
         self._writer.release()
+        if not opened:
+            try:
+                if os.path.isfile(self._tmp_path):
+                    os.remove(self._tmp_path)
+            except OSError:
+                pass
+            return
         try:
             shutil.move(self._tmp_path, self._final_path)
         except OSError as e:
@@ -397,20 +424,31 @@ def read_image_frame(fpath: str, gamma_correct_exr: bool = False) -> Optional[np
         img = imread_unicode(fpath, cv2.IMREAD_UNCHANGED)
         if img is None:
             return None
-        # Strip alpha channel from BGRA EXR
-        if img.ndim == 3 and img.shape[2] == 4:
-            img = img[:, :, :3]
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if img.ndim == 2:
+            img_rgb = np.stack([img, img, img], axis=-1)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img_rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+        else:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         result = np.maximum(img_rgb, 0.0).astype(np.float32)
         if gamma_correct_exr:
             result = _linear_to_srgb(result)
         return result
     else:
-        img = imread_unicode(fpath)
+        img = imread_unicode(fpath, cv2.IMREAD_UNCHANGED)
         if img is None:
             return None
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return img_rgb.astype(np.float32) / 255.0
+        if img.ndim == 2:
+            img_rgb = np.stack([img, img, img], axis=-1)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img_rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+        else:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if img_rgb.dtype == np.uint16:
+            return img_rgb.astype(np.float32) / 65535.0
+        if img_rgb.dtype == np.uint8:
+            return img_rgb.astype(np.float32) / 255.0
+        return np.clip(img_rgb.astype(np.float32), 0.0, 1.0)
 
 
 def read_video_frame_at(

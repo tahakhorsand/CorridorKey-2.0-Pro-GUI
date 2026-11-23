@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QTextCursor
 
+from ui.widgets.orbital_spinner import OrbitalSpinnerWidget
+
 
 def _fmt_duration(seconds: float) -> str:
     """Format seconds as H:MM:SS or M:SS."""
@@ -68,6 +70,8 @@ class StatusBar(QWidget):
     extract_clicked = Signal()
     resume_clicked = Signal()
     stop_clicked = Signal()
+    live_render_toggled = Signal(bool)
+    ram_preview_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,11 +92,26 @@ class StatusBar(QWidget):
         self._progress.setToolTip(self.tr("Inference progress for the current job"))
         layout.addWidget(self._progress)
 
+        # Compact Battle.net orbital spinner + Frame counter + timer
+        self._spinner = OrbitalSpinnerWidget(size=20, parent=self)
+        self._spinner.hide()
+        layout.addWidget(self._spinner)
+
         # Frame counter + timer
         self._frame_label = QLabel("")
         self._frame_label.setStyleSheet("color: #999980; font-size: 11px;")
-        self._frame_label.setMinimumWidth(220)
+        self._frame_label.setMinimumWidth(180)
         layout.addWidget(self._frame_label)
+
+        # Live Pixel Inspector readout (XY + RGB + Alpha)
+        self._pixel_label = QLabel("")
+        self._pixel_label.setObjectName("pixelInspectorLabel")
+        self._pixel_label.setStyleSheet(
+            "color: #D8D8B0; font-family: Consolas, monospace; font-size: 11px;"
+        )
+        self._pixel_label.setMinimumWidth(210)
+        self._pixel_label.setToolTip(self.tr("Live Pixel Inspector: cursor XY, sRGB, and Alpha readout"))
+        layout.addWidget(self._pixel_label)
 
         # Warning count (clickable)
         self._warn_btn = QPushButton("")
@@ -109,6 +128,47 @@ class StatusBar(QWidget):
 
         # Stretch pushes buttons to the right
         layout.addStretch(1)
+
+        # In-memory Live Render toggle (single current frame, zero disk writes)
+        self._live_render_allowed = False
+        self._live_render_busy = False
+        self._live_render_btn = QPushButton(self.tr("LIVE RENDER"))
+        self._live_render_btn.setObjectName("liveRenderButton")
+        self._live_render_btn.setCheckable(True)
+        self._live_render_btn.setChecked(False)
+        self._live_render_btn.setEnabled(False)
+        self._live_render_btn.setMinimumWidth(124)
+        self._live_render_btn.setFixedHeight(32)
+        self._live_render_btn.setCursor(Qt.PointingHandCursor)
+        self._live_render_btn.setToolTip(
+            self.tr(
+                "Toggle Live Render for the current frame only (in memory, no disk writes).\n"
+                "Every parameter tweak automatically updates this frame live before rendering the full sequence."
+            )
+        )
+        self._live_render_btn.toggled.connect(self._on_live_render_toggled)
+        self._refresh_live_render_style()
+        layout.addWidget(self._live_render_btn)
+
+        # 24-frame in-memory RAM Preview button
+        self._ram_busy = False
+        self._ram_btn = QPushButton(self.tr("RAM 24f"))
+        self._ram_btn.setObjectName("ramPreviewButton")
+        self._ram_btn.setFixedHeight(32)
+        self._ram_btn.setMinimumWidth(86)
+        self._ram_btn.setEnabled(False)
+        self._ram_btn.setCursor(Qt.PointingHandCursor)
+        self._ram_btn.setToolTip(
+            self.tr("Render up to 24 frames around playhead in memory for realtime playback (zero disk writes)")
+        )
+        self._ram_btn.setStyleSheet(
+            "QPushButton#ramPreviewButton { background-color: #1A190E; color: #B8B8A0; "
+            "border: 1px solid #353424; border-radius: 4px; font-weight: 600; font-size: 11px; padding: 0 8px; }"
+            "QPushButton#ramPreviewButton:hover { border-color: #FFF203; color: #FFFFFF; }"
+            "QPushButton#ramPreviewButton:disabled { color: #4A4A3A; border-color: #222216; background-color: #12120A; }"
+        )
+        self._ram_btn.clicked.connect(self.ram_preview_requested.emit)
+        layout.addWidget(self._ram_btn)
 
         # Run button (primary CTA)
         self._run_btn = QPushButton(self.tr("RUN INFERENCE"))
@@ -179,6 +239,8 @@ class StatusBar(QWidget):
     def set_running(self, running: bool) -> None:
         """Toggle between run/resume and stop state."""
         self._run_btn.setVisible(not running)
+        self._live_render_btn.setEnabled((not running) and self._live_render_allowed)
+        self._ram_btn.setEnabled((not running) and self._live_render_allowed)
         # Divider and resume visibility managed by update_button_state;
         # just hide them during a running job
         if running:
@@ -187,6 +249,79 @@ class StatusBar(QWidget):
         self._stop_btn.setVisible(running)
         if running:
             self.set_stop_button_mode(force=False)
+
+    def _on_live_render_toggled(self, checked: bool) -> None:
+        self._refresh_live_render_style()
+        self.live_render_toggled.emit(checked)
+
+    def set_live_render_checked(self, checked: bool) -> None:
+        old = self._live_render_btn.blockSignals(True)
+        try:
+            self._live_render_btn.setChecked(bool(checked))
+        finally:
+            self._live_render_btn.blockSignals(old)
+        self._refresh_live_render_style()
+
+    def set_live_render_enabled(self, enabled: bool) -> None:
+        self._live_render_allowed = bool(enabled)
+        running = self._stop_btn.isVisible()
+        self._live_render_btn.setEnabled(self._live_render_allowed and not running)
+        self._ram_btn.setEnabled(self._live_render_allowed and not running)
+
+    def _sync_spinner(self) -> None:
+        """Start/show compact orbital spinner while any job, RAM preview, or live render is active."""
+        if not hasattr(self, "_spinner"):
+            return
+        active = bool(self._job_start > 0 or self._live_render_busy or self._ram_busy)
+        if active:
+            self._spinner.show()
+            self._spinner.start()
+        else:
+            self._spinner.stop()
+            self._spinner.hide()
+
+    def set_ram_preview_busy(self, busy: bool, label: str | None = None) -> None:
+        self._ram_busy = bool(busy)
+        if label:
+            self._ram_btn.setText(label)
+        else:
+            self._ram_btn.setText(self.tr("CANCEL RAM") if self._ram_busy else self.tr("RAM 24f"))
+        self._sync_spinner()
+
+    def update_pixel_info(self, x: int, y: int, r: int, g: int, b: int, alpha: float) -> None:
+        self._pixel_label.setText(f"XY ({x},{y})  RGB ({r},{g},{b})  A {alpha:.3f}")
+
+    def clear_pixel_info(self) -> None:
+        self._pixel_label.setText("")
+
+    def set_live_render_busy(self, busy: bool) -> None:
+        self._live_render_busy = bool(busy)
+        self._live_render_btn.setText(
+            self.tr("LIVE RENDERING...") if self._live_render_busy else self.tr("LIVE RENDER")
+        )
+        self._refresh_live_render_style()
+        self._sync_spinner()
+
+    def _refresh_live_render_style(self) -> None:
+        checked = self._live_render_btn.isChecked()
+        if self._live_render_busy and checked:
+            self._live_render_btn.setStyleSheet(
+                "QPushButton#liveRenderButton { background-color: #2B2400; color: #FFF203; "
+                "border: 1px solid #FFF203; border-radius: 4px; font-weight: 700; font-size: 11px; padding: 0 10px; }"
+            )
+        elif checked:
+            self._live_render_btn.setStyleSheet(
+                "QPushButton#liveRenderButton { background-color: #102A18; color: #4CE870; "
+                "border: 1px solid #2CC350; border-radius: 4px; font-weight: 700; font-size: 11px; padding: 0 10px; }"
+                "QPushButton#liveRenderButton:hover { background-color: #163820; }"
+            )
+        else:
+            self._live_render_btn.setStyleSheet(
+                "QPushButton#liveRenderButton { background-color: #1A190E; color: #B8B8A0; "
+                "border: 1px solid #353424; border-radius: 4px; font-weight: 600; font-size: 11px; padding: 0 10px; }"
+                "QPushButton#liveRenderButton:hover { border-color: #FFF203; color: #FFFFFF; }"
+                "QPushButton#liveRenderButton:disabled { color: #4A4A3A; border-color: #222216; background-color: #12120A; }"
+            )
 
     def set_stop_button_mode(self, force: bool) -> None:
         """Switch STOP between cooperative cancel and hard-stop wording."""
@@ -275,10 +410,13 @@ class StatusBar(QWidget):
         self._frame_label.setText(f"{label}  0:00" if label else "0:00")
 
         self._tick_timer.start()
+        self._sync_spinner()
 
     def stop_job_timer(self) -> None:
         """Stop the elapsed timer."""
         self._tick_timer.stop()
+        self._job_start = 0.0
+        self._sync_spinner()
 
     def update_progress(self, current: int, total: int, fps: float = 0.0) -> None:
         """Update progress bar, frame counter, FPS, and ETA."""
@@ -335,6 +473,7 @@ class StatusBar(QWidget):
         self._warn_btn.setToolTip("")
         self._warn_btn.hide()
         self._job_start = 0.0
+        self._sync_spinner()
 
     def add_warning(self, message: str = "") -> None:
         """Add a warning message and update the counter."""

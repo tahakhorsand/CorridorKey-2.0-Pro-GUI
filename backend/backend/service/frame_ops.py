@@ -142,6 +142,8 @@ class FrameOpsMixin:
 
         alpha_stem_lookup: Optional[dict[str, str]] = None,
 
+        alpha_dir: Optional[str] = None,
+
     ) -> Optional[np.ndarray]:
 
         """Read a single alpha/mask frame and normalize to [H, W] float32."""
@@ -176,7 +178,10 @@ class FrameOpsMixin:
 
                 fname = alpha_files[frame_index]
 
-            fpath = os.path.join(clip.alpha_asset.path, fname)
+            base_dir = alpha_dir or (clip.alpha_asset.path if clip.alpha_asset else None)
+            if not base_dir:
+                return None
+            fpath = os.path.join(base_dir, fname)
 
             mask = read_mask_frame(fpath, clip.name, frame_index)
 
@@ -348,7 +353,13 @@ class FrameOpsMixin:
 
             if fg_fmt == "exr":
 
-                fg_rgb = _srgb_to_linear(fg_rgb)
+                if not res.get("fg_is_linear", False):
+
+                    fg_rgb = _srgb_to_linear(fg_rgb)
+
+            elif res.get("fg_is_linear", False):
+
+                fg_rgb = np.clip(_linear_to_srgb(np.maximum(fg_rgb, 0.0)), 0.0, 1.0)
 
             fg_bgr = cv2.cvtColor(fg_rgb.astype(np.float32), cv2.COLOR_RGB2BGR)
 

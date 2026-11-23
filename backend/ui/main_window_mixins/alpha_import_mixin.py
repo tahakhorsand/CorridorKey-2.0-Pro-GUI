@@ -24,22 +24,20 @@ class AlphaImportMixin:
     """Alpha import dialog and validation pipeline for MainWindow."""
 
     def _on_import_vmama_mask(self) -> None:
-        """Import masks directly into VideoMamaMaskHint/, bypassing SAM 3.1 tracking.
-
-        Sets a flag so the shared import flow writes to VideoMamaMaskHint/
-        instead of AlphaHint/. The clip transitions to MASKED, ready for
-        VideoMaMa to refine.
-        """
+        """Import masks directly into SamMaskHint/, bypassing SAM 3.1 tracking."""
         self._import_as_vmama_mask = True
         self._on_import_alpha()
 
     def _on_import_alpha(self) -> None:
-        """Import user-provided alpha hints into AlphaHint.
+        """Import user-provided alpha hints into AlphaHint or SamMaskHint."""
+        import_as_vmama_mask = bool(getattr(self, "_import_as_vmama_mask", False))
+        try:
+            self._run_import_alpha(import_as_vmama_mask)
+        finally:
+            self._import_as_vmama_mask = False
 
-        Image folders are renamed to match input frame stems. Final AlphaHint
-        imports preserve EXR files as EXR; video imports and VideoMaMa mask
-        imports are normalized into 8-bit PNG frame sequences.
-        """
+    def _run_import_alpha(self, import_as_vmama_mask: bool = False) -> None:
+        """Inner alpha/mask import flow (flag already captured & safely cleared)."""
         from ui.main_window import _remove_alpha_hint_assets, _import_alpha_video_as_sequence, _Toast
 
         clip = self._current_clip
@@ -155,12 +153,9 @@ class AlphaImportMixin:
             if result == QMessageBox.Cancel:
                 return
 
-        import_as_vmama_mask = getattr(self, '_import_as_vmama_mask', False)
-        self._import_as_vmama_mask = False  # reset flag
-
-        # Confirm import
+        # Confirm import (flag already safely captured in caller)
         n_paired = min(n_src, n_input)
-        target_name = "VideoMamaMaskHint" if import_as_vmama_mask else "AlphaHint"
+        target_name = "SamMaskHint" if import_as_vmama_mask else "AlphaHint"
         if source_kind == "video":
             msg = (
                 f"Import alpha video ({n_src} frames) into '{clip.name}'?\n\n"
@@ -187,7 +182,7 @@ class AlphaImportMixin:
         try:
             if import_as_vmama_mask:
                 # Clean existing mask hint directory
-                mask_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
+                mask_dir = os.path.join(clip.root_path, "SamMaskHint")
                 if os.path.isdir(mask_dir):
                     for f in os.listdir(mask_dir):
                         if f.lower().endswith(('.png', '.jpg', '.jpeg')):

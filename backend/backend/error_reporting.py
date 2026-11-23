@@ -31,7 +31,7 @@ def _origin_ok() -> bool:
 VALID_STAGES = frozenset({"installer", "updater", "runtime", "inference"})
 
 SETTINGS_ORG = "CorridorKey"
-SETTINGS_APP = "CorridorKey2"
+SETTINGS_APP = "CorridorKey 2.0"
 KEY_CRASH_REPORTS = "privacy/crash_reports_enabled"
 
 _install_id_cache: str | None = None
@@ -39,7 +39,12 @@ _crash_reporting_active = False
 
 
 def get_app_version() -> str:
-    """App version from the bundled pyproject.toml."""
+    """Return central application version string."""
+    try:
+        from . import APP_VERSION
+        return APP_VERSION
+    except Exception:
+        pass
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
@@ -57,7 +62,7 @@ def get_app_version() -> str:
                         return m.group(1)
         except OSError:
             continue
-    return "unknown"
+    return "2.0.0"
 
 
 def _config_dir() -> str:
@@ -65,14 +70,17 @@ def _config_dir() -> str:
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(
             "~\\AppData\\Local")
-        return os.path.join(base, "EZ-CorridorKey")
+        preferred = os.path.join(base, "CorridorKey 2.0")
+        legacy = os.path.join(base, "EZ-CorridorKey")
+        return legacy if (not os.path.exists(preferred) and os.path.exists(legacy)) else preferred
     if sys.platform == "darwin":
-        return os.path.expanduser(
-            "~/Library/Application Support/EZ-CorridorKey")
-    return os.path.join(
-        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        "EZ-CorridorKey",
-    )
+        preferred = os.path.expanduser("~/Library/Application Support/CorridorKey 2.0")
+        legacy = os.path.expanduser("~/Library/Application Support/EZ-CorridorKey")
+        return legacy if (not os.path.exists(preferred) and os.path.exists(legacy)) else preferred
+    xdg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    preferred = os.path.join(xdg, "CorridorKey 2.0")
+    legacy = os.path.join(xdg, "EZ-CorridorKey")
+    return legacy if (not os.path.exists(preferred) and os.path.exists(legacy)) else preferred
 
 
 def get_install_id() -> str:

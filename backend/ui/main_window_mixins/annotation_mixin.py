@@ -7,14 +7,9 @@ from __future__ import annotations
 
 
 import os
-
-
-
 import shutil
-
-
-
 import logging
+from collections import OrderedDict
 from typing import Any
 
 
@@ -352,57 +347,97 @@ class AnnotationMixin:
 
 
 
-        """Ctrl+Z: undo last stroke. Routes by chroma key mode."""
+        """Ctrl+Z: undo last stroke / mask paint edit / polygon edit."""
 
 
 
         iv = self._dual_viewer.input_viewer
 
-
-
-        if not iv.annotation_mode:
-
-
-
+        if iv.annotation_mode in ("mask_paint_fg", "mask_paint_bg") and self._undo_mask_paint():
+            return
+        if iv.annotation_mode in ("poly_garbage", "poly_core") and self._undo_polygon_edit():
             return
 
+        use_holdout = (
+            iv.annotation_mode == "holdout"
+            or (
+                self._is_chroma_key_active()
+                and iv.holdout_model.can_undo(0)
+                and not (iv.current_stem_index >= 0 and iv.annotation_model.can_undo(iv.current_stem_index))
+            )
+        )
 
-
-        if self._is_chroma_key_active():
-
-
+        if use_holdout:
 
             if iv.holdout_model.undo(0):
 
-
-
                 iv._split_view.update()
-
-
 
                 self._auto_save_holdout()
 
-
-
                 self._schedule_chroma_key_preview()
-
-
+                return
 
         elif iv.current_stem_index >= 0:
 
-
-
             if iv.annotation_model.undo(iv.current_stem_index):
-
-
 
                 iv._split_view.update()
 
+                self._auto_save_annotations()
+                self._update_annotation_info()
+                self._refresh_live_sam3_preview(iv.current_stem_index, force_recompute=True)
+                return
 
+        if self._undo_mask_paint():
+            return
+        self._undo_polygon_edit()
+
+    def _redo_annotation(self) -> None:
+
+        """Ctrl+Y / Ctrl+Shift+Z: redo last undone stroke / mask paint edit / polygon edit."""
+
+        iv = self._dual_viewer.input_viewer
+
+        if iv.annotation_mode in ("mask_paint_fg", "mask_paint_bg") and self._redo_mask_paint():
+            return
+        if iv.annotation_mode in ("poly_garbage", "poly_core") and self._redo_polygon_edit():
+            return
+
+        use_holdout = (
+            iv.annotation_mode == "holdout"
+            or (
+                self._is_chroma_key_active()
+                and iv.holdout_model.can_redo(0)
+                and not (iv.current_stem_index >= 0 and iv.annotation_model.can_redo(iv.current_stem_index))
+            )
+        )
+
+        if use_holdout:
+
+            if iv.holdout_model.redo(0):
+
+                iv._split_view.update()
+
+                self._auto_save_holdout()
+
+                self._schedule_chroma_key_preview()
+                return
+
+        elif iv.current_stem_index >= 0:
+
+            if iv.annotation_model.redo(iv.current_stem_index):
+
+                iv._split_view.update()
 
                 self._auto_save_annotations()
                 self._update_annotation_info()
-                self._schedule_sam3_preview()
+                self._refresh_live_sam3_preview(iv.current_stem_index, force_recompute=True)
+                return
+
+        if self._redo_mask_paint():
+            return
+        self._redo_polygon_edit()
 
 
 
@@ -688,52 +723,24 @@ class AnnotationMixin:
 
 
     @staticmethod
-
-
-
     def _sam3_preview_qimage(frame_rgb: np.ndarray, mask: np.ndarray) -> QImage:
+        """Render a soft-alpha rubylith translucent cutout overlay for live preview."""
+        alpha = np.clip(mask.astype(np.float32) * (1.0 / 255.0), 0.0, 1.0)[..., None]
+        fg = frame_rgb.astype(np.float32)
 
+        bg_tint = fg * 0.42 + np.array([75.0, 12.0, 24.0], dtype=np.float32) * 0.58
+        comp = fg * alpha + bg_tint * (1.0 - alpha)
 
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        bin_mask = (mask > 127).astype(np.uint8)
+        thin_edge = (cv2.dilate(bin_mask, k) ^ cv2.erode(bin_mask, k)) > 0
+        hair_soft = (mask > 20) & (mask < 235)
+        edge_only = thin_edge & (~hair_soft)
+        if np.any(edge_only):
+            comp[edge_only] = comp[edge_only] * 0.4 + np.array([255.0, 225.0, 40.0], dtype=np.float32) * 0.6
 
-        """Render a contour-only SAM 3.1 preview for the output viewer."""
-
-
-
-        overlay = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-
-
-                # Primary contour: solid subject silhouette and internal cutout boundaries
-        contours, _ = cv2.findContours(
-            (mask > 127).astype(np.uint8),
-            cv2.RETR_LIST,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-        valid_contours = [c for c in contours if cv2.contourArea(c) >= 50]
-        cv2.drawContours(overlay, valid_contours, -1, (0, 230, 255), 4)
-
-        # Secondary contour: soft hair strands ONLY (never outline the body)
-        soft_hair = ((mask > 15) & (mask < 240)).astype(np.uint8)
-        if np.count_nonzero(soft_hair) > 100:
-            hair_contours, _ = cv2.findContours(
-                soft_hair,
-                cv2.RETR_LIST,
-                cv2.CHAIN_APPROX_SIMPLE,
-            )
-            hair_valid = [c for c in hair_contours if 20 <= cv2.contourArea(c) <= 5000]
-            if hair_valid:
-                cv2.drawContours(overlay, hair_valid, -1, (255, 230, 0), 2)
-
-
-
-        rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-
-
-
+        rgb = np.clip(np.round(comp), 0, 255).astype(np.uint8).copy()
         h, w = rgb.shape[:2]
-
-
-
         return QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
 
 
@@ -944,8 +951,10 @@ class AnnotationMixin:
 
             self._update_annotation_info()
             self._auto_save_annotations()
-            self._last_sam3_preview = None
-            self._dual_viewer.output_viewer.navigate_to_frame(stem_idx)
+            if self._current_clip is not None:
+                self._invalidate_sam3_preview_cache_for_frame(self._current_clip.root_path, stem_idx)
+            self._sam3_preview_seq += 1
+            self._refresh_live_sam3_preview(stem_idx)
 
 
 
@@ -970,7 +979,7 @@ class AnnotationMixin:
         root = getattr(clip, "root_path", None)
         if not root or not os.path.isdir(root):
             return False
-        for d in ("VideoMamaMaskHint", "AlphaHint"):
+        for d in ("SamMaskHint", "VideoMamaMaskHint", "AlphaHint"):
             dp = os.path.join(root, d)
             if os.path.isdir(dp) and len(os.listdir(dp)) > 0:
                 return True
@@ -978,7 +987,7 @@ class AnnotationMixin:
             if os.path.isfile(os.path.join(root, f)):
                 return True
         import glob
-        for pat in ("VideoMamaMaskHint.*", "AlphaHint.*"):
+        for pat in ("SamMaskHint.*", "VideoMamaMaskHint.*", "AlphaHint.*"):
             candidates = glob.glob(os.path.join(root, pat))
             if any(os.path.isfile(c) for c in candidates):
                 return True
@@ -1058,6 +1067,8 @@ class AnnotationMixin:
                     pass
 
         # 4. Clear in-memory models on both viewports
+        self._clear_sam3_preview_cache()
+        self._sam3_preview_seq += 1
         if hasattr(self, "_dual_viewer"):
             iv = self._dual_viewer.input_viewer
             ov = self._dual_viewer.output_viewer
@@ -1065,6 +1076,8 @@ class AnnotationMixin:
             ov.clear_annotations()
             iv.holdout_model.clear()
             ov.holdout_model.clear()
+            self._dual_viewer.clear_live_preview()
+            self._dual_viewer.set_live_preview_modes(False)
 
         # 5. Clear assets & re-scan clip
         clip.mask_asset = None
@@ -1078,7 +1091,7 @@ class AnnotationMixin:
         # 6. Fallback view mode if viewing MASK or ALPHA
         if hasattr(self, "_dual_viewer"):
             if self._dual_viewer.current_output_mode in (ViewMode.MASK, ViewMode.ALPHA):
-                self._dual_viewer.set_output_mode(ViewMode.INPUT)
+                self._dual_viewer.output_viewer.set_view_mode(ViewMode.INPUT.value)
             self._sync_selected_clip_view(clip)
             self._dual_viewer.update()
 
@@ -1169,6 +1182,7 @@ class AnnotationMixin:
     _sam3_preview_timer: QTimer | None = None
     _sam3_preview_worker: Any = None
     _sam3_preview_pending: bool = False
+    _sam3_preview_seq: int = 0
     _last_sam3_preview: tuple[int, np.ndarray, np.ndarray] | None = None
 
     def _ensure_sam3_preview_timer(self) -> QTimer:
@@ -1179,6 +1193,50 @@ class AnnotationMixin:
             self._sam3_preview_timer.timeout.connect(self._do_sam3_preview)
         return self._sam3_preview_timer
 
+    def _invalidate_sam3_preview_cache_for_frame(self, clip_root: str, stem_idx: int) -> None:
+        cache = getattr(self, "_preview_mask_cache", None)
+        if isinstance(cache, (OrderedDict, dict)):
+            cache.pop((clip_root, stem_idx), None)
+        if self._last_sam3_preview is not None and self._last_sam3_preview[0] == stem_idx:
+            self._last_sam3_preview = None
+
+    def _refresh_live_sam3_preview(
+        self,
+        stem_idx: int | None = None,
+        *,
+        force_recompute: bool = False,
+    ) -> None:
+        """Synchronize live SAM 3.1 mode availability and output preview cleanly."""
+        if not hasattr(self, "_dual_viewer"):
+            return
+        iv = self._dual_viewer.input_viewer
+        if stem_idx is None:
+            stem_idx = iv.current_stem_index
+        has_any = iv.annotation_model.has_annotations()
+        self._dual_viewer.set_live_preview_modes(has_any)
+
+        clip = getattr(self, "_current_clip", None)
+        if clip is not None and stem_idx >= 0 and iv.annotation_model.has_annotations(stem_idx):
+            if force_recompute:
+                self._invalidate_sam3_preview_cache_for_frame(clip.root_path, stem_idx)
+                self._schedule_sam3_preview()
+                return
+            cached = self._get_cached_sam3_preview(clip.root_path, stem_idx)
+            if cached is not None:
+                frame_rgb, mask = cached
+                self._last_sam3_preview = (stem_idx, frame_rgb, mask)
+                qimg = self._render_sam3_preview_for_mode(frame_rgb, mask)
+                self._dual_viewer.show_reprocess_preview(qimg)
+            else:
+                self._schedule_sam3_preview()
+        else:
+            self._last_sam3_preview = None
+            ov = self._dual_viewer.output_viewer
+            if getattr(ov, "_live_preview_stem_idx", None) is not None or getattr(ov, "_live_extra_modes", None):
+                self._dual_viewer.clear_live_preview()
+            if stem_idx >= 0 and ov.current_stem_index != stem_idx:
+                ov.navigate_to_frame(stem_idx)
+
     def _schedule_sam3_preview(self) -> None:
         """Schedule a debounced live SAM 3.1 preview on the current frame."""
         clip = self._current_clip
@@ -1186,8 +1244,10 @@ class AnnotationMixin:
             return
         iv = self._dual_viewer.input_viewer
         stem_idx = iv.current_stem_index
+        self._dual_viewer.set_live_preview_modes(iv.annotation_model.has_annotations())
         if not iv.annotation_model.has_annotations(stem_idx):
             self._last_sam3_preview = None
+            self._dual_viewer.clear_live_preview()
             self._dual_viewer.output_viewer.navigate_to_frame(stem_idx)
             return
         self._ensure_sam3_preview_timer().start()
@@ -1206,8 +1266,10 @@ class AnnotationMixin:
         if stem_idx < 0 or stem_idx >= fi.frame_count:
             return
 
+        self._dual_viewer.set_live_preview_modes(iv.annotation_model.has_annotations())
         if not iv.annotation_model.has_annotations(stem_idx):
             self._last_sam3_preview = None
+            self._dual_viewer.clear_live_preview()
             self._dual_viewer.output_viewer.navigate_to_frame(stem_idx)
             return
 
@@ -1248,50 +1310,557 @@ class AnnotationMixin:
                 )
             ),
             hair_points=[(int(round(x)), int(round(y))) for x, y in getattr(pf, "hair_points", [])],
+            hair_strokes=[
+                ([(float(x), float(y)) for x, y in s_pts], float(r))
+                for s_pts, r in getattr(pf, "hair_strokes", [])
+            ],
             negative_strokes=[
                 ([(int(round(x)), int(round(y))) for x, y in s_pts], float(r))
                 for s_pts, r in getattr(pf, "negative_strokes", [])
             ],
         )
 
-        sequence_is_linear = getattr(self, "_input_exr_is_linear", False)
+        sequence_is_linear = (
+            self._input_is_linear_for_clip(clip)
+            if hasattr(self, "_input_is_linear_for_clip")
+            else getattr(self, "_input_exr_is_linear", False)
+        )
 
+        self._sam3_preview_seq += 1
+        req_seq = self._sam3_preview_seq
         self._sam3_preview_worker = SAM3LivePreviewWorker(
             input_path=input_path,
             prompt=prompt,
             stem_idx=stem_idx,
             service=self._service,
             is_linear=sequence_is_linear,
+            clip_root=clip.root_path,
             parent=self,
         )
+        self._sam3_preview_worker._sam3_seq = req_seq
         self._sam3_preview_worker.preview_ready.connect(self._on_sam3_preview_ready)
         self._sam3_preview_worker.finished.connect(self._on_sam3_preview_worker_finished)
         self._sam3_preview_worker.start()
 
+    _SAM3_PREVIEW_CACHE_MAX = 16
+
+    def _get_cached_sam3_preview(self, clip_root: str, stem_idx: int):
+        cache = getattr(self, "_preview_mask_cache", None)
+        if not isinstance(cache, OrderedDict):
+            return None
+        key = (clip_root, stem_idx)
+        if key not in cache:
+            return None
+        cache.move_to_end(key)
+        return cache[key]
+
+    def _cache_sam3_preview(self, clip_root: str, stem_idx: int, frame_rgb: np.ndarray, mask: np.ndarray) -> None:
+        cache = getattr(self, "_preview_mask_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
+            self._preview_mask_cache = cache
+        key = (clip_root, stem_idx)
+        cache[key] = (frame_rgb, mask)
+        cache.move_to_end(key)
+        while len(cache) > self._SAM3_PREVIEW_CACHE_MAX:
+            cache.popitem(last=False)
+
+    def _clear_sam3_preview_cache(self) -> None:
+        cache = getattr(self, "_preview_mask_cache", None)
+        if isinstance(cache, (OrderedDict, dict)):
+            cache.clear()
+        self._last_sam3_preview = None
+
     @Slot(int, object, object)
     def _on_sam3_preview_ready(self, stem_idx: int, frame_rgb: np.ndarray, mask: np.ndarray) -> None:
-        if not hasattr(self, "_preview_mask_cache"):
-            self._preview_mask_cache = {}
-        self._preview_mask_cache[stem_idx] = (frame_rgb, mask)
+        worker = self.sender()
+        worker_root = getattr(worker, "clip_root", "") if worker is not None else ""
+        worker_seq = getattr(worker, "_sam3_seq", None) if worker is not None else None
+        if worker_seq is not None and worker_seq != self._sam3_preview_seq:
+            return
+        clip = self._current_clip
+        if clip is None:
+            return
+        if worker_root and clip.root_path != worker_root:
+            return
         iv = self._dual_viewer.input_viewer
+        if not iv.annotation_model.has_annotations(stem_idx):
+            return
+        cache_root = worker_root or clip.root_path
+        self._cache_sam3_preview(cache_root, stem_idx, frame_rgb, mask)
         if iv.current_stem_index != stem_idx:
             return
+        self._dual_viewer.set_live_preview_modes(iv.annotation_model.has_annotations())
         self._last_sam3_preview = (stem_idx, frame_rgb, mask)
         qimg = self._render_sam3_preview_for_mode(frame_rgb, mask)
         self._dual_viewer.show_reprocess_preview(qimg)
 
     def _on_sam3_preview_worker_finished(self) -> None:
+        old_worker = self._sam3_preview_worker
         self._sam3_preview_worker = None
+        if old_worker is not None:
+            old_worker.deleteLater()
         if getattr(self, "_sam3_preview_pending", False):
             self._sam3_preview_pending = False
             self._do_sam3_preview()
 
     def _render_sam3_preview_for_mode(self, frame_rgb: np.ndarray, mask: np.ndarray) -> QImage:
         from ui.preview.frame_index import ViewMode
+        from ui.preview.display_transform import composite_over_backdrop
+
         mode = self._dual_viewer.current_output_mode
         if mode in (ViewMode.MATTE, ViewMode.MASK, ViewMode.ALPHA):
             h, w = mask.shape[:2]
             rgb = np.stack([mask, mask, mask], axis=2).copy()
             return QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        if mode == ViewMode.COMP:
+            comp = composite_over_backdrop(
+                frame_rgb.astype(np.float32) * (1.0 / 255.0),
+                mask.astype(np.float32) * (1.0 / 255.0),
+                backdrop=self._dual_viewer.current_backdrop,
+            ).copy()
+            h, w = comp.shape[:2]
+            return QImage(comp.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        if mode == ViewMode.FG:
+            fg_blk = composite_over_backdrop(
+                frame_rgb.astype(np.float32) * (1.0 / 255.0),
+                mask.astype(np.float32) * (1.0 / 255.0),
+                backdrop="black",
+            ).copy()
+            h, w = fg_blk.shape[:2]
+            return QImage(fg_blk.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        return self._sam3_preview_qimage(frame_rgb, mask)
+
+    # ── Multi-Subject ID, Polygon Garbage/Core Mattes & Post-Track Mask Paint ──
+
+    def _set_active_object_id(self, object_id: int) -> None:
+        oid = max(1, min(4, int(object_id)))
+        self._active_object_id = oid
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.set_active_object_id(oid)
+
+    def _toggle_annotation_mode_simple(self, mode: str) -> None:
+        iv = self._dual_viewer.input_viewer
+        ov = self._dual_viewer.output_viewer
+        if iv.annotation_mode == mode:
+            iv.set_annotation_mode(None)
+            ov.set_annotation_mode(None)
         else:
-            return self._sam3_preview_qimage(frame_rgb, mask)
+            self._deactivate_eyedropper_if_active()
+            iv.set_annotation_mode(mode)
+            ov.set_annotation_mode(None)
+            self._dual_viewer.set_holdout_active(False)
+
+    def _toggle_poly_garbage(self) -> None:
+        """Toggle Polygon Garbage Matte authoring mode."""
+        self._toggle_annotation_mode_simple("poly_garbage")
+
+    def _toggle_poly_core(self) -> None:
+        """Toggle Polygon Core Matte authoring mode."""
+        self._toggle_annotation_mode_simple("poly_core")
+
+    def _toggle_mask_paint_fg(self) -> None:
+        """Toggle direct post-track Mask Paint (+) mode."""
+        self._toggle_annotation_mode_simple("mask_paint_fg")
+
+    def _toggle_mask_paint_bg(self) -> None:
+        """Toggle direct post-track Mask Erase (-) mode."""
+        self._toggle_annotation_mode_simple("mask_paint_bg")
+
+    def _load_clip_polygon_model(self, clip: ClipEntry | None):
+        from backend.matte_shapes import PolygonMatteModel
+        if clip is None or not clip.root_path:
+            return PolygonMatteModel()
+        return PolygonMatteModel.load_from_clip(clip.root_path)
+
+    def _sync_polygon_model_to_viewer(self) -> None:
+        model = self._load_clip_polygon_model(getattr(self, "_current_clip", None))
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.set_polygon_model(model)
+
+    @Slot(str, object)
+    def _on_polygon_completed(self, kind: str, norm_points: object) -> None:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None or not norm_points or len(norm_points) < 3:
+            return
+        from backend.matte_shapes import PolygonMatteModel, PolygonMatteShape
+        frame_idx = int(self._dual_viewer.input_viewer.current_stem_index)
+        if frame_idx < 0:
+            frame_idx = 0
+        inverted = False
+        feather_px = 4
+        curved = False
+        if hasattr(self, "_param_panel") and self._param_panel is not None:
+            inverted = bool(getattr(self._param_panel, "poly_invert_checked", lambda: False)())
+            feather_px = int(getattr(self._param_panel, "poly_feather_value", lambda: 4)())
+            curved = bool(getattr(self._param_panel, "poly_curve_checked", lambda: False)())
+
+        model = PolygonMatteModel.load_from_clip(clip.root_path)
+        self._push_poly_undo(model)
+        shape = PolygonMatteShape(
+            kind="core" if kind == "core" else "garbage",
+            inverted=inverted,
+            feather_px=feather_px,
+            curved=curved,
+        )
+        shape.set_keyframe(frame_idx, list(norm_points))
+        model.add_shape(shape)
+        model.save_to_clip(clip.root_path)
+        self._dual_viewer.set_polygon_model(model)
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_message(
+                f"Saved {shape.kind} polygon matte keyframe @ frame {frame_idx + 1} ({len(model.shapes)} shape(s))"
+            )
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+
+    def _get_poly_undo_stack(self):
+        from backend.matte_shapes import PolygonUndoStack
+        st = getattr(self, "_poly_undo_stack", None)
+        if st is None:
+            st = PolygonUndoStack(max_depth=40)
+            self._poly_undo_stack = st
+        return st
+
+    def _push_poly_undo(self, model) -> None:
+        self._get_poly_undo_stack().push(model)
+
+    def _undo_polygon_edit(self) -> bool:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None:
+            return False
+        from backend.matte_shapes import PolygonMatteModel
+        model = PolygonMatteModel.load_from_clip(clip.root_path)
+        if not self._get_poly_undo_stack().undo(model):
+            return False
+        model.save_to_clip(clip.root_path)
+        self._dual_viewer.set_polygon_model(model)
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+        return True
+
+    def _redo_polygon_edit(self) -> bool:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None:
+            return False
+        from backend.matte_shapes import PolygonMatteModel
+        model = PolygonMatteModel.load_from_clip(clip.root_path)
+        if not self._get_poly_undo_stack().redo(model):
+            return False
+        model.save_to_clip(clip.root_path)
+        self._dual_viewer.set_polygon_model(model)
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+        return True
+
+    @Slot(str, int, int, float, float)
+    def _on_polygon_vertex_moved(self, shape_id: str, frame_idx: int, vertex_idx: int, nx: float, ny: float) -> None:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.matte_shapes import PolygonMatteModel
+        model = PolygonMatteModel.load_from_clip(clip.root_path)
+        self._push_poly_undo(model)
+        changed = False
+        for s in model.shapes:
+            if s.shape_id == shape_id:
+                changed = s.move_vertex(frame_idx, vertex_idx, nx, ny)
+                break
+        if not changed:
+            return
+        model.save_to_clip(clip.root_path)
+        self._dual_viewer.set_polygon_model(model)
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+
+    @Slot(bool)
+    def _on_poly_curve_changed(self, curved: bool) -> None:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.matte_shapes import PolygonMatteModel
+        model = PolygonMatteModel.load_from_clip(clip.root_path)
+        if not model.shapes:
+            return
+        self._push_poly_undo(model)
+        model.shapes[-1].curved = bool(curved)
+        model.save_to_clip(clip.root_path)
+        self._dual_viewer.set_polygon_model(model)
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+
+    @Slot(bool)
+    def _on_poly_invert_changed(self, inverted: bool) -> None:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.matte_shapes import PolygonMatteModel
+        model = PolygonMatteModel.load_from_clip(clip.root_path)
+        if not model.shapes:
+            return
+        self._push_poly_undo(model)
+        model.shapes[-1].inverted = bool(inverted)
+        model.save_to_clip(clip.root_path)
+        self._dual_viewer.set_polygon_model(model)
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+
+    @Slot(int)
+    def _on_poly_feather_changed(self, feather_px: int) -> None:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.matte_shapes import PolygonMatteModel
+        model = PolygonMatteModel.load_from_clip(clip.root_path)
+        if not model.shapes:
+            return
+        self._push_poly_undo(model)
+        model.shapes[-1].feather_px = max(0, int(feather_px))
+        model.save_to_clip(clip.root_path)
+        self._dual_viewer.set_polygon_model(model)
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+
+    def _clear_polygon_mattes(self) -> None:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.matte_shapes import PolygonMatteModel
+        model = PolygonMatteModel.load_from_clip(clip.root_path)
+        if model.shapes:
+            self._push_poly_undo(model)
+        model = PolygonMatteModel()
+        model.save_to_clip(clip.root_path)
+        self._dual_viewer.set_polygon_model(model)
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_message("Cleared polygon mattes")
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+
+    @staticmethod
+    def _get_clip_frame_stems_and_size(clip: ClipEntry) -> tuple[list[str], int, int]:
+        from backend.frame_io import imread_unicode
+        if clip.input_asset is not None and clip.input_asset.asset_type == "sequence":
+            files = clip.input_asset.get_frame_files()
+            stems = [os.path.splitext(fn)[0] for fn in files]
+            w, h = 1920, 1080
+            if files:
+                img = imread_unicode(os.path.join(clip.input_asset.path, files[0]))
+                if img is not None:
+                    h, w = img.shape[:2]
+            return stems, w, h
+        count = max(1, clip.input_asset.frame_count if clip.input_asset else 1)
+        return [f"frame_{i:06d}" for i in range(count)], 1920, 1080
+
+    @Slot(int, str, object, float)
+    def _on_mask_paint_stroke(self, frame_idx: int, action: str, points: object, radius: float) -> None:
+        clip = getattr(self, "_current_clip", None)
+        if clip is None or not points:
+            return
+        import cv2
+        from backend.frame_io import imread_unicode, imwrite_unicode
+        from backend.clip_state import ClipAsset
+
+        stems, w, h = self._get_clip_frame_stems_and_size(clip)
+        if frame_idx < 0 or frame_idx >= len(stems):
+            return
+        stem = stems[frame_idx]
+
+        # Ensure SamMaskHint exists cleanly (never VideoMamaMaskHint)
+        sam_dir = os.path.join(clip.root_path, "SamMaskHint")
+        os.makedirs(sam_dir, exist_ok=True)
+        sam_path = os.path.join(sam_dir, f"{stem}.png")
+
+        target_paths = [sam_path]
+        alpha_hint_dir = os.path.join(clip.root_path, "AlphaHint")
+        alpha_hint_path = os.path.join(alpha_hint_dir, f"{stem}.png")
+        if os.path.isdir(alpha_hint_dir):
+            target_paths.append(alpha_hint_path)
+
+        base_mask = None
+        for cand in (sam_path, alpha_hint_path):
+            if os.path.isfile(cand):
+                base_mask = imread_unicode(cand, cv2.IMREAD_GRAYSCALE)
+                if base_mask is not None:
+                    break
+        if base_mask is None:
+            base_mask = np.zeros((h, w), dtype=np.uint8)
+        else:
+            h, w = base_mask.shape[:2]
+
+        paint_val = 255 if action == "add" else 0
+        r = max(1, int(round(radius)))
+        pts_list = [(float(px), float(py)) for px, py in points]
+        for px, py in pts_list:
+            cv2.circle(base_mask, (int(round(px)), int(round(py))), r, paint_val, -1)
+        for i in range(len(pts_list) - 1):
+            p1 = (int(round(pts_list[i][0])), int(round(pts_list[i][1])))
+            p2 = (int(round(pts_list[i + 1][0])), int(round(pts_list[i + 1][1])))
+            cv2.line(base_mask, p1, p2, paint_val, r * 2)
+
+        # Snapshot previous mask bytes for multi-step Undo/Redo (capped at 30 steps)
+        snap_before: dict[str, bytes | None] = {}
+        for p in target_paths:
+            if os.path.isfile(p):
+                with open(p, "rb") as rf:
+                    snap_before[p] = rf.read()
+            else:
+                snap_before[p] = None
+        undo_q = getattr(self, "_mask_paint_undo", None)
+        if undo_q is None:
+            undo_q = []
+            self._mask_paint_undo = undo_q
+        redo_q = getattr(self, "_mask_paint_redo", None)
+        if redo_q is None:
+            redo_q = []
+            self._mask_paint_redo = redo_q
+        undo_q.append((clip.root_path, int(frame_idx), snap_before))
+        if len(undo_q) > 30:
+            undo_q.pop(0)
+        redo_q.clear()
+
+        for out_p in target_paths:
+            imwrite_unicode(out_p, base_mask)
+
+        clip.find_assets()
+        if hasattr(self, "_clip_model"):
+            self._clip_model.update_clip_state(clip.name, clip.state)
+        if hasattr(self, "_io_tray"):
+            self._io_tray.refresh()
+        if hasattr(self, "_refresh_button_state"):
+            self._refresh_button_state()
+
+        self._invalidate_sam3_preview_cache_for_frame(clip.root_path, frame_idx)
+        from ui.preview.display_transform import clear_cache
+        clear_cache()
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.input_viewer.refresh_current_frame()
+            self._dual_viewer.output_viewer.refresh_current_frame()
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+
+    def _restore_mask_paint_snapshot(self, entry: tuple[str, int, dict]) -> tuple[str, int, dict]:
+        """Swap on-disk mask files with `entry` and return the reverse snapshot for undo/redo."""
+        clip_root, f_idx, snap = entry
+        reverse: dict[str, bytes | None] = {}
+        for p, prev_bytes in snap.items():
+            if os.path.isfile(p):
+                with open(p, "rb") as rf:
+                    reverse[p] = rf.read()
+            else:
+                reverse[p] = None
+            if prev_bytes is None:
+                if os.path.isfile(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            else:
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as wf:
+                    wf.write(prev_bytes)
+        self._invalidate_sam3_preview_cache_for_frame(clip_root, f_idx)
+        clip = next((c for c in self._clip_model.clips if c.root_path == clip_root), None) if hasattr(self, "_clip_model") else None
+        if clip is not None:
+            clip.find_assets()
+            self._clip_model.update_clip_state(clip.name, clip.state)
+            if hasattr(self, "_io_tray"):
+                self._io_tray.refresh()
+            if hasattr(self, "_refresh_button_state"):
+                self._refresh_button_state()
+        from ui.preview.display_transform import clear_cache
+        clear_cache()
+        if hasattr(self, "_dual_viewer"):
+            self._dual_viewer.input_viewer.refresh_current_frame()
+            self._dual_viewer.output_viewer.refresh_current_frame()
+        if hasattr(self, "_reprocess_timer") and self._param_panel.live_preview_enabled:
+            self._reprocess_timer.start()
+        return (clip_root, f_idx, reverse)
+
+    def _undo_mask_paint(self) -> bool:
+        undo_q = getattr(self, "_mask_paint_undo", None)
+        if not undo_q:
+            return False
+        redo_q = getattr(self, "_mask_paint_redo", None)
+        if redo_q is None:
+            redo_q = []
+            self._mask_paint_redo = redo_q
+        entry = undo_q.pop()
+        redo_q.append(self._restore_mask_paint_snapshot(entry))
+        return True
+
+    def _redo_mask_paint(self) -> bool:
+        redo_q = getattr(self, "_mask_paint_redo", None)
+        if not redo_q:
+            return False
+        undo_q = getattr(self, "_mask_paint_undo", None)
+        if undo_q is None:
+            undo_q = []
+            self._mask_paint_undo = undo_q
+        entry = redo_q.pop()
+        undo_q.append(self._restore_mask_paint_snapshot(entry))
+        return True
+
+    def _interpolate_mask_range(
+        self,
+        start_idx: int | None = None,
+        end_idx: int | None = None,
+    ) -> int:
+        """Linearly interpolate saved masks between [In, Out] endpoints without GPU re-tracking."""
+        clip = getattr(self, "_current_clip", None)
+        if clip is None:
+            return 0
+        import cv2
+        from backend.frame_io import imread_unicode, imwrite_unicode
+
+        stems, w, h = self._get_clip_frame_stems_and_size(clip)
+        if len(stems) < 3:
+            return 0
+        if start_idx is None or end_idx is None:
+            io_in, io_out = self._dual_viewer.get_in_out() if hasattr(self, "_dual_viewer") else (-1, -1)
+            if 0 <= io_in <= io_out < len(stems):
+                start_idx, end_idx = io_in, io_out
+            else:
+                start_idx, end_idx = 0, len(stems) - 1
+        lo = max(0, min(int(start_idx), int(end_idx)))
+        hi = min(len(stems) - 1, max(int(start_idx), int(end_idx)))
+        if hi - lo < 2:
+            if hasattr(self, "_status_bar"):
+                self._status_bar.set_message("Set In/Out range spanning at least 3 frames to interpolate")
+            return 0
+
+        updated = 0
+        for folder in ("SamMaskHint", "AlphaHint"):
+            mdir = os.path.join(clip.root_path, folder)
+            if not os.path.isdir(mdir):
+                continue
+            p0 = os.path.join(mdir, f"{stems[lo]}.png")
+            p1 = os.path.join(mdir, f"{stems[hi]}.png")
+            if not (os.path.isfile(p0) and os.path.isfile(p1)):
+                continue
+            m0 = imread_unicode(p0, cv2.IMREAD_GRAYSCALE)
+            m1 = imread_unicode(p1, cv2.IMREAD_GRAYSCALE)
+            if m0 is None or m1 is None:
+                continue
+            if m1.shape != m0.shape:
+                m1 = cv2.resize(m1, (m0.shape[1], m0.shape[0]), interpolation=cv2.INTER_LINEAR)
+            f0 = m0.astype(np.float32)
+            f1 = m1.astype(np.float32)
+            for idx in range(lo + 1, hi):
+                t = float(idx - lo) / float(hi - lo)
+                blend = np.clip(np.round(f0 * (1.0 - t) + f1 * t), 0, 255).astype(np.uint8)
+                imwrite_unicode(os.path.join(mdir, f"{stems[idx]}.png"), blend)
+                self._invalidate_sam3_preview_cache_for_frame(clip.root_path, idx)
+                updated += 1
+
+        if updated > 0:
+            from ui.preview.display_transform import clear_cache
+            clear_cache()
+            if hasattr(self, "_dual_viewer"):
+                self._dual_viewer.input_viewer.refresh_current_frame()
+                self._dual_viewer.output_viewer.refresh_current_frame()
+            if hasattr(self, "_param_panel") and self._param_panel.live_preview_enabled and hasattr(self, "_reprocess_timer"):
+                self._reprocess_timer.start()
+            if hasattr(self, "_status_bar"):
+                self._status_bar.set_message(f"Interpolated masks across frames {lo + 1}..{hi + 1}")
+        return updated

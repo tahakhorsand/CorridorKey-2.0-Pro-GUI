@@ -40,19 +40,19 @@ _DIAGNOSTICS: list[Diagnostic] = [
         ),
         explanation=(
             "Your PyTorch installation does not include CUDA support, so "
-            "GPU-accelerated pipelines (GVM, VideoMaMa) cannot run.  This "
+            "GPU-accelerated pipelines (CorridorKey, SAM 3.1, BiRefNet) cannot run.  This "
             "usually means the installer picked the CPU-only wheels, or "
             "PyTorch was installed separately without the CUDA index."
         ),
         steps=[
-            "Open a terminal in the EZ-CorridorKey folder.",
+            "Open a terminal in the CorridorKey 2.0 folder.",
             "Activate the virtual environment:\n"
-            "    .venv\\Scripts\\activate",
+            "    backend\\venv\\Scripts\\activate",
             "Reinstall PyTorch with CUDA:\n"
             "    pip install torch torchvision --index-url\n"
-            "    https://download.pytorch.org/whl/cu128",
+            "    https://download.pytorch.org/whl/cu124",
             "Restart CorridorKey 2.0.",
-            "If you don't have an NVIDIA GPU, GVM and VideoMaMa\n"
+            "If you don't have an NVIDIA GPU, AI GPU models\n"
             "are not supported — use manual alpha hints instead.",
         ],
         tags=["gpu", "cuda", "cpu", "float16"],
@@ -63,18 +63,19 @@ _DIAGNOSTICS: list[Diagnostic] = [
         title="Model Checkpoint Not Found",
         pattern=re.compile(
             r"No \.pth checkpoint found|"
-            r"checkpoints.*not found|"
-            r"CorridorKey\.pth.*missing",
+            r"No \.safetensors checkpoint found|"
+            r"weights.*not found|"
+            r"corridorkey_v2.*missing",
             re.IGNORECASE,
         ),
         explanation=(
-            "The CorridorKey model weights (.pth file) are missing from the "
-            "checkpoints folder.  The model must be downloaded separately."
+            "The CorridorKey 2.0 model weights file is missing from the "
+            "weights folder.  The model must be downloaded first."
         ),
         steps=[
-            "Download CorridorKey.pth from the project release page\n"
-            "or the link in the README.",
-            "Place the file in:\n"
+            "Use Help > Setup Wizard inside CorridorKey 2.0\n"
+            "to download the model weights automatically.",
+            "Or place the weights file in:\n"
             "    weights/corridorkey_v2.safetensors",
             "Restart CorridorKey 2.0.",
         ],
@@ -171,9 +172,9 @@ _DIAGNOSTICS: list[Diagnostic] = [
             "Without it, inference will still work but will be slower."
         ),
         steps=[
-            "Open a terminal in the EZ-CorridorKey folder.",
+            "Open a terminal in the CorridorKey 2.0 folder.",
             "Activate the virtual environment:\n"
-            "    .venv\\Scripts\\activate",
+            "    backend\\venv\\Scripts\\activate",
             "Install triton-windows:\n"
             "    pip install triton-windows",
             "Restart CorridorKey 2.0.",
@@ -196,7 +197,7 @@ _DIAGNOSTICS: list[Diagnostic] = [
             "Install Visual Studio Build Tools from:\n"
             "    https://visualstudio.microsoft.com/visual-cpp-build-tools/",
             'Select "Desktop development with C++" workload.',
-            "Restart your computer, then restart EZ-CorridorKey.",
+            "Restart your computer, then restart CorridorKey 2.0.",
             "Alternatively, this is safe to ignore — inference just runs a bit slower.",
         ],
         tags=["compile", "msvc"],
@@ -213,21 +214,21 @@ _DIAGNOSTICS: list[Diagnostic] = [
         explanation=(
             "You have the CPU-only build of PyTorch installed even though "
             "an NVIDIA GPU is present. This means none of the GPU-accelerated "
-            "models (CorridorKey, GVM, VideoMaMa) can use your GPU. "
+            "models (CorridorKey, SAM 3.1, BiRefNet) can use your GPU. "
             "This usually happens when PyTorch was installed without the "
             "CUDA index URL."
         ),
         steps=[
-            "Open a terminal in the EZ-CorridorKey folder.",
+            "Open a terminal in the CorridorKey 2.0 folder.",
             "Activate the virtual environment:\n"
-            "    .venv\\Scripts\\activate  (or venv\\Scripts\\activate)",
+            "    backend\\venv\\Scripts\\activate",
             "Uninstall the CPU-only build:\n"
             "    pip uninstall torch torchvision -y",
             "Reinstall with CUDA support:\n"
             "    pip install torch torchvision --index-url\n"
-            "    https://download.pytorch.org/whl/cu128",
+            "    https://download.pytorch.org/whl/cu124",
             "Restart CorridorKey 2.0.",
-            "Tip: re-running 1-install.bat will also fix this automatically.",
+            "Tip: re-running install.bat will also fix this automatically.",
         ],
         tags=["gpu", "cuda", "cpu", "wheel"],
     ),
@@ -292,18 +293,18 @@ _DIAGNOSTICS: list[Diagnostic] = [
             re.IGNORECASE,
         ),
         explanation=(
-            "EZ-CorridorKey requires Python 3.10–3.13.  Your current "
+            "CorridorKey 2.0 requires Python 3.10–3.13.  Your current "
             "Python version is not compatible."
         ),
         steps=[
-            "Download Python 3.11 from https://python.org",
+            "Download Python 3.12 from https://python.org",
             "During installation, check 'Add Python to PATH'.",
-            "Delete the existing .venv folder.",
-            "Re-run 1-install.bat to create a fresh environment.",
+            "Delete the existing backend\\venv folder.",
+            "Re-run install.bat to create a fresh environment.",
         ],
         tags=["python", "version"],
     ),
-    # ── Pascal GPU on cu130 wheel (1.9.1 → 1.9.2 upgrade path) ───
+    # ── Pascal GPU on newer wheel upgrade path ───
     Diagnostic(
         id="pascal-cu130-mismatch",
         title="Older NVIDIA GPU Detected — Reinstall Required",
@@ -317,20 +318,17 @@ _DIAGNOSTICS: list[Diagnostic] = [
             "10-series, Titan X/Xp, or older Quadro). The PyTorch build "
             "currently installed in this app does not include the "
             "GPU kernels needed for your card, so AI keying will fail "
-            "at inference time with a CUDA error. EZ-CorridorKey 1.9.2 "
-            "ships a new PyTorch build that supports your GPU, but the "
-            "in-app updater intentionally does not replace the heavy "
-            "runtime files — you need to download the full installer "
-            "once to upgrade them."
+            "at inference time with a CUDA error. Reinstalling with a "
+            "compatible PyTorch build resolves this."
         ),
         steps=[
-            "Download the latest installer from:\n"
-            "    https://github.com/edenaion/EZ-CorridorKey/releases/latest",
-            "Run the installer over your existing install —\n"
+            "Download the latest release from:\n"
+            "    https://github.com/tahakhorsand/CorridorKey-2.0-Pro-GUI/releases/latest",
+            "Run install.bat or update your environment —\n"
             "your projects, settings, and model weights are preserved.",
             "After reinstalling, future updates will work normally\n"
             "via Help > Check for Updates.",
-            "If you do not want to reinstall, EZ-CorridorKey cannot\n"
+            "If you do not want to reinstall, CorridorKey 2.0 cannot\n"
             "use your GPU on this version. AI keying will not work.",
         ],
         tags=["pascal", "gpu", "cuda", "upgrade"],
@@ -593,7 +591,7 @@ def _steps_no_nvidia_gpu() -> list[str]:
     present. Stops the user from chasing pip reinstalls that cannot
     possibly help them."""
     return [
-        "EZ-CorridorKey requires an NVIDIA GPU.\n"
+        "CorridorKey 2.0 requires an NVIDIA GPU.\n"
         "There is no CPU fallback for the keying models.",
         "Check that your computer has an NVIDIA graphics card\n"
         "(GeForce RTX, GTX, Quadro, or similar).",
@@ -602,7 +600,7 @@ def _steps_no_nvidia_gpu() -> list[str]:
         "Open a terminal and run:\n"
         "    nvidia-smi\n"
         "If this command is not found, the driver is not installed.",
-        "If you do not have an NVIDIA GPU, EZ-CorridorKey's\n"
+        "If you do not have an NVIDIA GPU, CorridorKey 2.0's\n"
         "AI pipelines cannot run on this machine.",
     ]
 
@@ -612,8 +610,8 @@ def _steps_frozen_reinstall(reason: str) -> list[str]:
     official build is the correct remedy, not pip."""
     return [
         f"{reason}",
-        "Download the latest installer from:\n"
-        "    https://github.com/edenaion/EZ-CorridorKey/releases/latest",
+        "Download the latest release from:\n"
+        "    https://github.com/tahakhorsand/CorridorKey-2.0-Pro-GUI/releases/latest",
         "Run the installer over your existing install —\n"
         "your projects and settings will be preserved.",
         "If the problem persists after reinstalling, please\n"
@@ -675,7 +673,7 @@ def _resolve_missing_checkpoint(ctx: dict, base: list[str]) -> list[str]:
         return [
             "Model weights are downloaded by the first-run Setup\n"
             "Wizard. If you dismissed it, reopen the app and follow\n"
-            "the setup prompts to fetch CorridorKey.pth (~383 MB).",
+            "the setup prompts to fetch the CorridorKey 2.0 weights.",
             "If the wizard does not appear, go to:\n"
             "    Edit > Preferences > Re-run Setup Wizard",
             "If the download fails, please click Report Issue on\n"

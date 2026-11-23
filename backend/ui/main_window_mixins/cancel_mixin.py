@@ -88,7 +88,7 @@ class CancelMixin:
         logger.info("Processing cancelled by user")
         if is_videomama:
             _Toast(self, _tr("GPU is finishing the current chunk.\n"
-                             "VideoMaMa will stop after it completes."),
+                             "Alpha refinement will stop after it completes."),
                    center=True)
 
     def _force_restart_app(self) -> None:
@@ -180,5 +180,7 @@ class CancelMixin:
         """Cancel a specific job from the queue panel."""
         job = self._service.job_queue.find_job_by_id(job_id)
         if job:
+            if job.id == getattr(self, "_active_job_id", None):
+                self._cancel_requested_job_id = job.id
             self._service.job_queue.cancel_job(job)
             self._queue_panel.refresh()

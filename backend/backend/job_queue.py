@@ -115,6 +115,7 @@ class GPUJobQueue:
         self._lock = threading.Lock()
         self._running_jobs: list[GPUJob] = []  # supports multiple concurrent jobs
         self._history: list[GPUJob] = []  # completed/cancelled/failed jobs for UI display
+        self._paused: bool = False
 
         # Callbacks (set by UI or CLI)
         self.on_progress: Optional[ProgressCallback] = None
@@ -129,7 +130,7 @@ class GPUJobQueue:
         reprocess in the queue is replaced by the new one (latest-only).
         """
         with self._lock:
-            # Preview jobs: replace existing queued jobs of the same preview type.
+            # Preview jobs: replace queued jobs of same preview type and cancel stale running ones.
             if job.job_type in (JobType.PREVIEW_REPROCESS, JobType.SAM3_PREVIEW):
                 replaced = [
                     j for j in self._queue
@@ -144,6 +145,9 @@ class GPUJobQueue:
                         job.id,
                         job.job_type.value,
                     )
+                for rj in self._running_jobs:
+                    if rj.job_type == job.job_type and rj.status == JobStatus.RUNNING:
+                        rj.request_cancel()
             else:
                 # Deduplication: reject if same clip+job_type already queued or running
                 for existing in self._queue:
@@ -171,9 +175,26 @@ class GPUJobQueue:
             logger.info(f"Job queued [{job.id}]: {job.job_type.value} for '{job.clip_name}'")
             return True
 
-    def next_job(self) -> Optional[GPUJob]:
-        """Get the next pending job without starting it. Returns None if empty."""
+    def pause(self) -> None:
+        """Pause dispatching new pending jobs (current running jobs finish cleanly)."""
         with self._lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        """Resume dispatching pending jobs."""
+        with self._lock:
+            self._paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def next_job(self) -> Optional[GPUJob]:
+        """Get the next pending job without starting it. Returns None if empty or paused."""
+        with self._lock:
+            if self._paused:
+                return None
             if self._queue:
                 return self._queue[0]
             return None
@@ -246,6 +267,41 @@ class GPUJobQueue:
                 job.request_cancel()
                 logger.info(f"Job cancel requested [{job.id}]: {job.job_type.value} for '{job.clip_name}'")
 
+    def cancel_job_by_id(self, job_id: str) -> bool:
+        """Cancel a queued or running job by ID. Returns True if matched."""
+        with self._lock:
+            for job in list(self._queue):
+                if job.id == job_id:
+                    self._queue.remove(job)
+                    job.status = JobStatus.CANCELLED
+                    self._history.append(job)
+                    logger.info(f"Job removed from queue [{job.id}]: {job.job_type.value} for '{job.clip_name}'")
+                    return True
+            for job in self._running_jobs:
+                if job.id == job_id and job.status == JobStatus.RUNNING:
+                    job.request_cancel()
+                    logger.info(f"Job cancel requested [{job.id}]: {job.job_type.value} for '{job.clip_name}'")
+                    return True
+        return False
+
+    def cancel_clips(self, clip_names: set[str]) -> int:
+        """Cancel all queued and running jobs matching any clip name in ``clip_names``."""
+        if not clip_names:
+            return 0
+        count = 0
+        with self._lock:
+            for job in list(self._queue):
+                if job.clip_name in clip_names:
+                    self._queue.remove(job)
+                    job.status = JobStatus.CANCELLED
+                    self._history.append(job)
+                    count += 1
+            for job in self._running_jobs:
+                if job.clip_name in clip_names and job.status == JobStatus.RUNNING:
+                    job.request_cancel()
+                    count += 1
+        return count
+
     def cancel_current(self) -> None:
         """Cancel all currently running jobs."""
         with self._lock:
@@ -266,18 +322,24 @@ class GPUJobQueue:
             self._queue.clear()
             logger.info("All jobs cancelled")
 
-    def report_progress(self, clip_name: str, current: int, total: int, **kwargs: float) -> None:
+    def report_progress(self, clip_name: str, current: int, total: int, job_id: Optional[str] = None, **kwargs: float) -> None:
         """Report progress for a running job. Called by processing code.
 
-        Finds the matching job by clip_name among running jobs.
+        Finds the matching job by job_id (preferred) or clip_name among running jobs.
         Optional kwargs: fps, elapsed, eta_seconds.
         """
         with self._lock:
             for job in self._running_jobs:
-                if job.clip_name == clip_name and job.status == JobStatus.RUNNING:
-                    job.current_frame = current
-                    job.total_frames = total
-                    break
+                if job.status != JobStatus.RUNNING:
+                    continue
+                if job_id is not None:
+                    if job.id != job_id:
+                        continue
+                elif job.clip_name != clip_name:
+                    continue
+                job.current_frame = current
+                job.total_frames = total
+                break
         if self.on_progress:
             self.on_progress(clip_name, current, total, **kwargs)
 
@@ -315,6 +377,15 @@ class GPUJobQueue:
     def has_pending(self) -> bool:
         with self._lock:
             return len(self._queue) > 0
+
+    @property
+    def has_non_preview_running(self) -> bool:
+        with self._lock:
+            return any(
+                rj.status == JobStatus.RUNNING
+                and rj.job_type not in (JobType.PREVIEW_REPROCESS, JobType.SAM3_PREVIEW)
+                for rj in self._running_jobs
+            )
 
     @property
     def current_job(self) -> Optional[GPUJob]:

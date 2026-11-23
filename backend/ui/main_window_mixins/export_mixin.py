@@ -2,20 +2,127 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import sys
+import threading
 
-from PySide6.QtWidgets import QMessageBox, QFileDialog, QProgressDialog
-from PySide6.QtCore import Slot, QThread, Qt
+from PySide6.QtWidgets import QMessageBox, QFileDialog
+from ui.widgets.orbital_spinner import OrbitalProgressDialog
+from PySide6.QtCore import Slot, QThread, Signal, Qt
 
 from . import _tr
 
 from backend import ClipEntry, ClipState
 from backend.clip_state import ClipAsset
 from backend import InOutRange
+from backend.natural_sort import natsorted
 from backend.project import save_in_out_range
 
 logger = logging.getLogger(__name__)
+
+
+class _ExportVideoWorker(QThread):
+    """Background FFmpeg video stitching worker for single and batch exports."""
+
+    progress_changed = Signal(int, int, str)
+    export_finished = Signal(list, list, list, bool)
+
+    def __init__(self, tasks: list[dict], parent=None) -> None:
+        super().__init__(parent)
+        self._tasks = tasks
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        from backend.ffmpeg_tools import read_video_metadata, stitch_video
+
+        exported: list[str] = []
+        failed: list[str] = []
+        clips_done: list = []
+        single_mode = len(self._tasks) == 1
+
+        for idx, task in enumerate(self._tasks):
+            if self._cancel_event.is_set():
+                break
+            clip = task["clip"]
+            src = task["in_dir"]
+            out_path = task["out_path"]
+            subdir = task["subdir"]
+            fps = float(task.get("fps") or 0.0)
+            if fps <= 0.0:
+                meta = read_video_metadata(clip.root_path)
+                fps = float(meta.get("fps", 24.0)) if meta else 24.0
+                if fps <= 0.0:
+                    fps = 24.0
+
+            pattern = task.get("pattern")
+            start_number = int(task.get("start_number", 0))
+            if not pattern:
+                frames = natsorted(
+                    f for f in os.listdir(src)
+                    if os.path.splitext(f)[1].lower()
+                    in (".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff")
+                )
+                if not frames:
+                    continue
+                first = frames[0]
+                m = re.match(r"^(.*?)(\d+)(\.\w+)$", first)
+                if m:
+                    prefix, digits, suffix = m.group(1), m.group(2), m.group(3)
+                    pattern = f"{prefix}%0{len(digits)}d{suffix}"
+                    start_number = int(digits)
+                else:
+                    fext = os.path.splitext(first)[1]
+                    pattern = f"frame_%06d{fext}"
+                    start_number = 0
+
+            label = clip.name if single_mode else f"{clip.name} / {subdir}"
+            if not single_mode:
+                self.progress_changed.emit(idx, len(self._tasks), label)
+
+            def _on_prog(curr: int, tot: int, _lbl=label) -> None:
+                if single_mode and tot > 0:
+                    self.progress_changed.emit(curr, tot, _lbl)
+
+            try:
+                src_video = task.get("source_video_path")
+                if not src_video:
+                    src_dir_p = os.path.join(clip.root_path, "Source")
+                    if os.path.isdir(src_dir_p):
+                        vids = sorted(
+                            fn for fn in os.listdir(src_dir_p)
+                            if os.path.splitext(fn)[1].lower() in (".mp4", ".mov", ".mxf", ".mkv", ".avi")
+                        )
+                        if vids:
+                            src_video = os.path.join(src_dir_p, vids[0])
+                    elif getattr(clip, "input_asset", None) is not None and clip.input_asset.asset_type == "video":
+                        src_video = clip.input_asset.path
+
+                stitch_video(
+                    in_dir=src,
+                    out_path=out_path,
+                    fps=fps,
+                    pattern=pattern,
+                    codec=str(task.get("codec") or "libx264"),
+                    start_number=start_number,
+                    on_progress=_on_prog,
+                    cancel_event=self._cancel_event,
+                    source_video_path=src_video,
+                    start_frame_offset=int(task.get("start_frame_offset", 0) or 0),
+                    timecode=task.get("timecode"),
+                    preserve_audio=bool(task.get("preserve_audio", True)),
+                )
+                if not self._cancel_event.is_set():
+                    exported.append(f"{clip.name}/{subdir}")
+                    clips_done.append(clip)
+            except Exception as e:
+                logger.error("Export failed for %s/%s: %s", clip.name, subdir, e)
+                failed.append(f"{clip.name}/{subdir}: {e}")
+
+        self.export_finished.emit(exported, failed, clips_done, self._cancel_event.is_set())
 
 
 class ExportMixin:
@@ -271,7 +378,7 @@ class ExportMixin:
                 return
 
         # Read video metadata for fps
-        from backend.ffmpeg_tools import read_video_metadata, stitch_video, require_ffmpeg_install
+        from backend.ffmpeg_tools import read_video_metadata, require_ffmpeg_install
         try:
             require_ffmpeg_install(require_probe=True)
         except RuntimeError as exc:
@@ -295,32 +402,45 @@ class ExportMixin:
             default_name = f"{clip.name}_{subdir_name}_export.mov"
             file_filter = (
                 "MOV ProRes 4444 with Alpha (*.mov);;"
+                "MOV ProRes 422 HQ (*.mov);;"
                 "WebM VP9 with Alpha (*.webm);;"
                 "MP4 Video (*.mp4);;"
                 "All Files (*)"
             )
         else:
             default_name = f"{clip.name}_{subdir_name}_export.mp4"
-            file_filter = "MP4 Video (*.mp4);;MOV ProRes (*.mov);;WebM Video (*.webm);;All Files (*)"
+            file_filter = (
+                "MP4 Video (*.mp4);;"
+                "MOV ProRes 422 HQ (*.mov);;"
+                "MOV ProRes 4444 (*.mov);;"
+                "WebM Video (*.webm);;"
+                "All Files (*)"
+            )
 
         default_path = os.path.join(exports_dir, default_name)
-        out_path, _ = QFileDialog.getSaveFileName(
+        out_path, selected_filter = QFileDialog.getSaveFileName(
             self, _tr("Export Video"), default_path,
             file_filter,
         )
         if not out_path:
             return
+        export_codec = "libx264"
+        if "422 HQ" in (selected_filter or ""):
+            export_codec = "prores_422hq"
+        elif "4444" in (selected_filter or "") or out_path.lower().endswith(".mov"):
+            export_codec = "prores_4444"
+        elif out_path.lower().endswith(".webm"):
+            export_codec = "libvpx-vp9"
 
-        # Determine frame pattern from actual files
-        frames = sorted([f for f in os.listdir(source_dir)
-                         if os.path.splitext(f)[1].lower()
-                         in ('.png', '.jpg', '.jpeg', '.exr', '.tif', '.tiff')])
+        # Determine frame pattern from actual files (naturally sorted)
+        frames = natsorted([f for f in os.listdir(source_dir)
+                            if os.path.splitext(f)[1].lower()
+                            in ('.png', '.jpg', '.jpeg', '.exr', '.tif', '.tiff')])
         if not frames:
             QMessageBox.warning(self, _tr("No Frames"), _tr("No image frames found in output directory."))
             return
 
         # Detect pattern from first filename (e.g. frame_000000.png -> frame_%06d.png)
-        import re
         first = frames[0]
         ext = os.path.splitext(first)[1]
         m = re.match(r'^(.*?)(\d+)(\.\w+)$', first)
@@ -333,43 +453,219 @@ class ExportMixin:
             pattern = f"frame_%06d{ext}"
             start_number = 0
 
-        self._status_bar.set_message(_tr("Exporting %s...") % clip.name)
+        start_offset = clip.in_out_range.in_point if clip.in_out_range else 0
+        tasks = [{
+            "clip": clip,
+            "in_dir": source_dir,
+            "out_path": out_path,
+            "fps": fps,
+            "codec": export_codec,
+            "pattern": pattern,
+            "start_number": start_number,
+            "start_frame_offset": start_offset,
+            "preserve_audio": True,
+            "subdir": subdir_name,
+        }]
+        self._start_video_export_worker(
+            tasks,
+            title=_tr("Export Video"),
+            total_steps=len(frames),
+            single_out_path=out_path,
+        )
 
-        try:
-            stitch_video(
-                in_dir=source_dir,
-                out_path=out_path,
-                fps=fps,
-                pattern=pattern,
-                start_number=start_number,
-            )
+    def _on_export_nuke_script(self, clip: ClipEntry | None = None) -> None:
+        clip = clip or getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.ffmpeg_tools import read_video_metadata, probe_audio_and_timecode
+        from backend.nle_export import export_nuke_script
+        meta = read_video_metadata(clip.root_path) or {}
+        fps = float(meta.get("fps") or 24.0)
+        tc = "01:00:00:00"
+        src_dir = os.path.join(clip.root_path, "Source")
+        if os.path.isdir(src_dir):
+            vids = sorted(fn for fn in os.listdir(src_dir) if os.path.splitext(fn)[1].lower() in (".mp4", ".mov", ".mxf"))
+            if vids:
+                probed = probe_audio_and_timecode(os.path.join(src_dir, vids[0]))
+                tc = probed.get("timecode") or tc
+        default_dir = os.path.join(clip.root_path, "_EXPORTS")
+        os.makedirs(default_dir, exist_ok=True)
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            _tr("Export Nuke Script"),
+            os.path.join(default_dir, f"{clip.name}.nk"),
+            "Nuke Script (*.nk);;All Files (*)",
+        )
+        if not out_path:
+            return
+        export_nuke_script(clip, out_path, fps=fps, timecode=tc)
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_message(_tr("Exported Nuke script: %s") % os.path.basename(out_path))
+
+    def _on_export_fcpxml(self, clip: ClipEntry | None = None) -> None:
+        clip = clip or getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.ffmpeg_tools import read_video_metadata, probe_audio_and_timecode
+        from backend.nle_export import export_fcpxml
+        meta = read_video_metadata(clip.root_path) or {}
+        fps = float(meta.get("fps") or 24.0)
+        tc = "01:00:00:00"
+        src_dir = os.path.join(clip.root_path, "Source")
+        if os.path.isdir(src_dir):
+            vids = sorted(fn for fn in os.listdir(src_dir) if os.path.splitext(fn)[1].lower() in (".mp4", ".mov", ".mxf"))
+            if vids:
+                probed = probe_audio_and_timecode(os.path.join(src_dir, vids[0]))
+                tc = probed.get("timecode") or tc
+        default_dir = os.path.join(clip.root_path, "_EXPORTS")
+        os.makedirs(default_dir, exist_ok=True)
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            _tr("Export FCPXML Timeline"),
+            os.path.join(default_dir, f"{clip.name}.fcpxml"),
+            "Final Cut Pro XML (*.fcpxml);;All Files (*)",
+        )
+        if not out_path:
+            return
+        export_fcpxml(clip, out_path, fps=fps, timecode=tc)
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_message(_tr("Exported FCPXML: %s") % os.path.basename(out_path))
+
+    def _on_export_ae_jsx(self, clip: ClipEntry | None = None) -> None:
+        clip = clip or getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.ffmpeg_tools import read_video_metadata
+        from backend.nle_export import export_ae_jsx
+        meta = read_video_metadata(clip.root_path) or {}
+        fps = float(meta.get("fps") or 24.0)
+        default_dir = os.path.join(clip.root_path, "_EXPORTS")
+        os.makedirs(default_dir, exist_ok=True)
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            _tr("Export After Effects Script"),
+            os.path.join(default_dir, f"{clip.name}.jsx"),
+            "After Effects JSX (*.jsx);;All Files (*)",
+        )
+        if not out_path:
+            return
+        export_ae_jsx(clip, out_path, fps=fps)
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_message(_tr("Exported After Effects script: %s") % os.path.basename(out_path))
+
+    def _on_export_fusion_comp(self, clip: ClipEntry | None = None) -> None:
+        clip = clip or getattr(self, "_current_clip", None)
+        if clip is None:
+            return
+        from backend.ffmpeg_tools import read_video_metadata
+        from backend.nle_export import export_fusion_comp
+        meta = read_video_metadata(clip.root_path) or {}
+        fps = float(meta.get("fps") or 24.0)
+        default_dir = os.path.join(clip.root_path, "_EXPORTS")
+        os.makedirs(default_dir, exist_ok=True)
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            _tr("Export DaVinci Fusion Comp"),
+            os.path.join(default_dir, f"{clip.name}.comp"),
+            "Fusion Comp (*.comp);;All Files (*)",
+        )
+        if not out_path:
+            return
+        export_fusion_comp(clip, out_path, fps=fps)
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_message(_tr("Exported Fusion comp: %s") % os.path.basename(out_path))
+
+    def _start_video_export_worker(
+        self,
+        tasks: list[dict],
+        *,
+        title: str,
+        total_steps: int,
+        single_out_path: str | None = None,
+    ) -> None:
+        """Run FFmpeg export asynchronously in _ExportVideoWorker without freezing UI."""
+        existing = getattr(self, "_export_worker", None)
+        if existing is not None and existing.isRunning():
+            QMessageBox.information(self, title, _tr("A video export is already in progress."))
+            return
+
+        progress = OrbitalProgressDialog(
+            _tr("Preparing video export..."), _tr("Cancel"), 0, max(1, total_steps), self,
+        )
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+
+        self._status_bar.set_message(_tr("Exporting video..."))
+        worker = _ExportVideoWorker(tasks, parent=self)
+        self._export_worker = worker
+        progress.canceled.connect(worker.request_cancel)
+
+        def _on_progress(current: int, total: int, label: str) -> None:
+            if total > 0 and progress.maximum() != total:
+                progress.setMaximum(total)
+            progress.setLabelText(_tr("Exporting %s...") % label)
+            progress.setValue(current)
+
+        def _on_finished(exported: list, failed: list, clips_done: list, cancelled: bool) -> None:
+            progress.close()
+            progress.deleteLater()
+            self._export_worker = None
+            worker.deleteLater()
             self._status_bar.set_message("")
-            self._refresh_export_thumbnail(clip)
-            self._io_tray.refresh()
-            QMessageBox.information(
-                self, _tr("Export Complete"),
-                _tr("Video exported:\n%s") % out_path,
-            )
-        except Exception as e:
-            self._status_bar.set_message("")
-            from ui.sounds.audio_manager import UIAudio
-            UIAudio.error()
-            QMessageBox.critical(
-                self, _tr("Export Failed"),
-                _tr("Failed to export video:\n%s") % e,
-            )
+
+            for c in clips_done:
+                self._refresh_export_thumbnail(c)
+            if exported:
+                self._io_tray.refresh()
+
+            if cancelled:
+                return
+            if single_out_path is not None:
+                if exported:
+                    QMessageBox.information(
+                        self, _tr("Export Complete"),
+                        _tr("Video exported:\n%s") % single_out_path,
+                    )
+                elif failed:
+                    from ui.sounds.audio_manager import UIAudio
+                    UIAudio.error()
+                    QMessageBox.critical(
+                        self, _tr("Export Failed"),
+                        _tr("Failed to export video:\n%s") % failed[0],
+                    )
+                return
+
+            summary = f"Exported {len(exported)} video(s)."
+            if failed:
+                summary += f"\n\n{len(failed)} failed:\n" + "\n".join(failed[:5])
+            if exported:
+                from ui.sounds.audio_manager import UIAudio
+                UIAudio.frame_extract_done()
+                QMessageBox.information(self, _tr("Batch Export Complete"), summary)
+            elif failed:
+                from ui.sounds.audio_manager import UIAudio
+                UIAudio.error()
+                QMessageBox.warning(self, _tr("Batch Export"), summary)
+
+        worker.progress_changed.connect(_on_progress)
+        worker.export_finished.connect(_on_finished)
+        worker.start()
 
     # ── Batch Export Video ──
 
     def _on_export_all_videos(self) -> None:
         """Show selection dialog, then export chosen clip outputs as video.
 
-        Processed → WebM (VP9 alpha), everything else → MP4.
+        Processed → ProRes 4444/WebM alpha, everything else → MP4.
         Writes to each clip's _EXPORTS/ folder.
         """
-        from backend.ffmpeg_tools import read_video_metadata, stitch_video, require_ffmpeg_install
+        from backend.ffmpeg_tools import require_ffmpeg_install
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QLabel, QComboBox
-        import re
 
         try:
             require_ffmpeg_install(require_probe=True)
@@ -471,70 +767,21 @@ class ExportMixin:
         if not selected:
             return
 
-        # ── Export with progress ──
-        progress = QProgressDialog(
-            _tr("Exporting videos..."), _tr("Cancel"), 0, len(selected), self,
+        tasks = [
+            {
+                "clip": clip,
+                "in_dir": src,
+                "out_path": out_path,
+                "subdir": subdir,
+            }
+            for clip, src, out_path, subdir in selected
+        ]
+        self._start_video_export_worker(
+            tasks,
+            title=_tr("Batch Export"),
+            total_steps=len(tasks),
+            single_out_path=None,
         )
-        progress.setWindowTitle(_tr("Batch Export"))
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-
-        exported = []
-        failed = []
-        for i, (clip, src, out_path, subdir) in enumerate(selected):
-            if progress.wasCanceled():
-                break
-            progress.setLabelText(_tr("Exporting %s / %s...") % (clip.name, subdir))
-            progress.setValue(i)
-
-            metadata = read_video_metadata(clip.root_path)
-            fps = metadata.get("fps", 24.0) if metadata else 24.0
-
-            frames = sorted(
-                f for f in os.listdir(src)
-                if os.path.splitext(f)[1].lower()
-                in ('.png', '.jpg', '.jpeg', '.exr', '.tif', '.tiff')
-            )
-            if not frames:
-                continue
-
-            first = frames[0]
-            m = re.match(r'^(.*?)(\d+)(\.\w+)$', first)
-            if m:
-                prefix, digits, suffix = m.group(1), m.group(2), m.group(3)
-                pattern = f"{prefix}%0{len(digits)}d{suffix}"
-                start_number = int(digits)
-            else:
-                fext = os.path.splitext(first)[1]
-                pattern = f"frame_%06d{fext}"
-                start_number = 0
-
-            try:
-                stitch_video(
-                    in_dir=src, out_path=out_path, fps=fps,
-                    pattern=pattern, start_number=start_number,
-                )
-                exported.append(f"{clip.name}/{subdir}")
-            except Exception as e:
-                logger.error(f"Batch export failed for {clip.name}/{subdir}: {e}")
-                failed.append(f"{clip.name}/{subdir}: {e}")
-
-        progress.setValue(len(selected))
-
-        summary = f"Exported {len(exported)} video(s)."
-        if failed:
-            summary += f"\n\n{len(failed)} failed:\n" + "\n".join(failed[:5])
-        if exported:
-            for c, _, _, _ in selected:
-                self._refresh_export_thumbnail(c)
-            self._io_tray.refresh()
-            from ui.sounds.audio_manager import UIAudio
-            UIAudio.frame_extract_done()
-            QMessageBox.information(self, _tr("Batch Export Complete"), summary)
-        elif failed:
-            from ui.sounds.audio_manager import UIAudio
-            UIAudio.error()
-            QMessageBox.warning(self, _tr("Batch Export"), summary)
 
     # ── View Controls ──
 

@@ -45,6 +45,9 @@ class MenuMixin:
         file_menu.addAction(_tr("Export Video..."), self._on_export_video)
         file_menu.addAction(_tr("Export All Videos"), self._on_export_all_videos)
         file_menu.addSeparator()
+        file_menu.addAction(_tr("Disk Cache Manager..."), self._on_disk_cache_manager)
+        file_menu.addAction(_tr("Collect & Pack Project (.zip)..."), self._on_pack_project_zip)
+        file_menu.addSeparator()
         file_menu.addAction(_tr("Return to Home"), self._return_to_welcome)
         file_menu.addAction(_tr("Exit"), self.close)
 
@@ -142,3 +145,48 @@ class MenuMixin:
         save_project_output_dir(self._clips_dir, None)
         logger.info("Project output folder cleared")
         self._refresh_project_output_actions()
+
+    def _on_disk_cache_manager(self) -> None:
+        root = getattr(self, "_clips_dir", None) or (
+            getattr(self._current_clip, "root_path", None) if getattr(self, "_current_clip", None) else None
+        )
+        if not root:
+            QMessageBox.information(self, _tr("Disk Cache Manager"), _tr("Open a project or clip first."))
+            return
+        from backend.project_tools import clean_project_cache, scan_project_disk_usage
+        usage = scan_project_disk_usage(root)
+        fmt = lambda b: f"{b / (1024 * 1024):.1f} MB"
+        summary = (
+            f"Frames (extracted): {fmt(usage['frames'])}\n"
+            f"Masks (SamMaskHint): {fmt(usage['masks'])}\n"
+            f"Alpha Hints: {fmt(usage['alpha_hints'])}\n"
+            f"Outputs (FG/Matte/Comp): {fmt(usage['outputs'])}\n"
+            f"Exports: {fmt(usage['exports'])}\n"
+            f"Source Media (Protected): {fmt(usage['source'])}\n\n"
+            "Clean extracted Frames/ & Alpha Hints caches now? (Source media is untouched)"
+        )
+        reply = QMessageBox.question(self, _tr("Disk Cache Manager"), summary, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            freed = clean_project_cache(root, ["frames", "alpha_hints"])
+            QMessageBox.information(self, _tr("Cache Cleaned"), _tr("Freed %.1f MB.") % (freed / (1024 * 1024)))
+
+    def _on_pack_project_zip(self) -> None:
+        root = getattr(self, "_clips_dir", None) or (
+            getattr(self._current_clip, "root_path", None) if getattr(self, "_current_clip", None) else None
+        )
+        if not root:
+            QMessageBox.information(self, _tr("Collect Project"), _tr("Open a project first."))
+            return
+        import os as _os
+        out_zip, _ = QFileDialog.getSaveFileName(
+            self,
+            _tr("Collect & Pack Project (.zip)"),
+            _os.path.join(_os.path.dirname(root), _os.path.basename(root) + "_bundle.zip"),
+            "Zip Archive (*.zip);;All Files (*)",
+        )
+        if not out_zip:
+            return
+        from backend.project_tools import pack_project_zip
+        pack_project_zip(root, out_zip, include_frames=False)
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_message(_tr("Project archived: %s") % _os.path.basename(out_zip))

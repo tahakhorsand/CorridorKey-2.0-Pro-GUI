@@ -191,6 +191,12 @@ def run_gui() -> int:
     window = MainWindow(service, store)
     window.show()
     rc = app.exec()
+    try:
+        from PySide6.QtCore import QSettings
+        QSettings().sync()
+    except Exception:
+        pass
+    logging.shutdown()
     # Force-exit: torch.compile spawns Triton background threads that prevent
     # clean shutdown, leaving a zombie process holding VRAM.
     os._exit(rc)
@@ -222,8 +228,10 @@ def run_cli() -> int:
             continue
         if arg in ("--cli", "--gui"):
             continue
-        if arg == "--log-level":
+        if arg in ("--log-level", "--opt-mode"):
             skip_next = True  # skip the value that follows
+            continue
+        if arg.startswith("--log-level=") or arg.startswith("--opt-mode="):
             continue
         forwarded.append(arg)
 

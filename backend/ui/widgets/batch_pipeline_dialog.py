@@ -86,6 +86,13 @@ class BatchPipelineDialog(QDialog):
         else:
             super().closeEvent(event)
 
+    def reject(self) -> None:
+        """Hide instead of rejecting via Esc while batch is active."""
+        if self._batch_active:
+            self.hide()
+            return
+        super().reject()
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setSpacing(12)
@@ -127,8 +134,8 @@ class BatchPipelineDialog(QDialog):
         no_hint_lbl.setStyleSheet("color: #A0A090;")
         no_hint_lbl.setToolTip(self.tr(
             "Alpha generation method for clips with no companion hint file.\n"
-            "GVM: fast automatic alpha.\n"
-            "BiRefNet: higher quality, select a model variant."
+            "BiRefNet: AI foreground matte (select a model variant).\n"
+            "Standalone: skip hint generation and key directly in CorridorKey 2.0."
         ))
         global_layout.addWidget(no_hint_lbl)
         self._global_no_hint = QComboBox()
@@ -368,11 +375,8 @@ class BatchPipelineDialog(QDialog):
     # Global / per-clip toggle
     # ------------------------------------------------------------------
 
-    @Slot()
-    def _on_global_changed(self) -> None:
-        """Propagate global settings to all per-clip combos (when in global mode)."""
-        if self._per_clip_cb.isChecked():
-            return
+    def _propagate_globals_to_rows(self) -> None:
+        """Copy global pipeline choices into every per-clip combo row."""
         for row, clip in enumerate(self._clips):
             combo = self._per_clip_combos[row]
             if combo is None:
@@ -385,15 +389,22 @@ class BatchPipelineDialog(QDialog):
                 if br:
                     br.setCurrentIndex(self._global_birefnet_variant.currentIndex())
 
+    @Slot()
+    def _on_global_changed(self) -> None:
+        """Propagate global settings to all per-clip combos (when in global mode)."""
+        if self._per_clip_cb.isChecked():
+            return
+        self._propagate_globals_to_rows()
+
     @Slot(bool)
     def _on_per_clip_toggled(self, checked: bool) -> None:
         """Toggle between global and per-clip mode."""
+        if checked:
+            # Propagate current global values to all rows BEFORE locking globals out
+            self._propagate_globals_to_rows()
+
         # Gray out globals when per-clip is enabled
         self._global_group.setEnabled(not checked)
-
-        if checked:
-            # Propagate current global values to all rows first
-            self._on_global_changed()
 
         # Enable/disable per-clip combos
         for row, clip in enumerate(self._clips):

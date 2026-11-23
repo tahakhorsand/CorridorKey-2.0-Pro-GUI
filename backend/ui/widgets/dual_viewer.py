@@ -32,7 +32,7 @@ from PySide6.QtGui import QImage
 
 
 
-from backend import ClipEntry
+from backend import ClipEntry, ClipState
 
 from ui.preview.frame_index import FrameIndex, ViewMode
 
@@ -68,6 +68,18 @@ class DualViewerPanel(QWidget):
 
     output_mode_changed = Signal(str)
 
+    output_backdrop_changed = Signal(str)
+
+    custom_plate_requested = Signal()
+
+    pixel_hovered = Signal(int, int, int, int, int, float)
+
+    polygon_completed = Signal(str, object)
+
+    polygon_vertex_moved = Signal(str, int, int, float, float)
+
+    mask_paint_stroke = Signal(int, str, object, float)
+
 
 
     def __init__(self, parent=None):
@@ -81,6 +93,12 @@ class DualViewerPanel(QWidget):
 
 
         self._wipe_active = False
+
+        self._snapshot_image: QImage | None = None
+
+        self._sam3_live_modes: set[ViewMode] = set()
+
+        self._render_live_modes: set[ViewMode] = set()
 
 
 
@@ -103,6 +121,8 @@ class DualViewerPanel(QWidget):
         self._input_viewer = PreviewViewport(show_scrubber=False)
 
         self._input_viewer.lock_mode(ViewMode.INPUT)
+
+        self._input_viewer._mode_bar.set_backdrop_visible(False)
 
         self._viewer_splitter.addWidget(self._input_viewer)
 
@@ -144,6 +164,9 @@ class DualViewerPanel(QWidget):
 
         self._wipe_overlay.hide()
 
+        from ui.widgets.orbital_spinner import OrbitalBusyOverlay
+        self._busy_overlay = OrbitalBusyOverlay(parent=self)
+
 
 
         # A/B wipe button — lives in the input viewer's top bar, right edge
@@ -151,6 +174,10 @@ class DualViewerPanel(QWidget):
         self._ab_button = self._input_viewer.add_ab_button()
 
         self._ab_button.clicked.connect(self.toggle_wipe_mode)
+
+        self._snap_button = self._input_viewer.add_snap_button()
+
+        self._snap_button.clicked.connect(self.toggle_snapshot_compare)
 
 
 
@@ -210,13 +237,49 @@ class DualViewerPanel(QWidget):
 
             self._input_viewer._split_view.set_view_transform)
 
+        self._input_viewer._split_view.view_transform_changed.connect(
+
+            self._wipe_overlay.set_view_transform)
+
+        self._output_viewer._split_view.view_transform_changed.connect(
+
+            self._wipe_overlay.set_view_transform)
+
+        self._wipe_overlay.view_transform_changed.connect(
+
+            self._input_viewer._split_view.set_view_transform)
+
+        self._wipe_overlay.view_transform_changed.connect(
+
+            self._output_viewer._split_view.set_view_transform)
 
 
-        # Refresh wipe overlay when output viewer decodes a new frame or switches mode
 
-        self._output_viewer._decoder.frame_decoded.connect(self._on_wipe_frame_ready)
+        # Refresh wipe overlay whenever either viewer updates its displayed image (async, cache hit, mode switch, live preview)
 
-        self._input_viewer._decoder.frame_decoded.connect(self._on_wipe_frame_ready)
+        self._output_viewer.frame_updated.connect(self._load_wipe_images)
+
+        self._input_viewer.frame_updated.connect(self._load_wipe_images)
+
+        self._output_viewer.backdrop_changed.connect(self._on_backdrop_changed_wipe)
+
+        self._output_viewer.backdrop_changed.connect(self.output_backdrop_changed.emit)
+
+        self._output_viewer.custom_plate_requested.connect(self.custom_plate_requested.emit)
+
+        self._input_viewer.pixel_hovered.connect(self.pixel_hovered.emit)
+
+        self._output_viewer.pixel_hovered.connect(self.pixel_hovered.emit)
+
+        self._wipe_overlay.pixel_hovered.connect(self.pixel_hovered.emit)
+
+        self._input_viewer.polygon_completed.connect(self.polygon_completed.emit)
+
+        self._input_viewer.polygon_vertex_moved.connect(self.polygon_vertex_moved.emit)
+
+        self._input_viewer.mask_paint_stroke.connect(self.mask_paint_stroke.emit)
+
+        self._output_viewer._mode_bar.inspect_mode_changed.connect(self._wipe_overlay.set_inspect_mode)
 
 
 
@@ -237,6 +300,14 @@ class DualViewerPanel(QWidget):
         """Current output viewer mode."""
 
         return self._output_viewer._current_mode
+
+    @property
+
+    def current_backdrop(self) -> str:
+
+        """Current output viewer compositing backdrop."""
+
+        return self._output_viewer.current_backdrop
 
 
 
@@ -340,6 +411,14 @@ class DualViewerPanel(QWidget):
 
         """Load a clip into both viewers and configure the scrubber."""
 
+        same_clip = (
+            self._clip is not None
+            and clip is not None
+            and self._clip.root_path == clip.root_path
+            and self._clip.state != ClipState.EXTRACTING
+        )
+        prev_frame = self._scrubber.current_frame()
+
         self._clip = clip
 
 
@@ -358,11 +437,60 @@ class DualViewerPanel(QWidget):
 
         if fi:
 
+            fps = 24.0
+
+            try:
+
+                from backend.ffmpeg_tools import read_video_metadata
+
+                meta = read_video_metadata(clip.root_path)
+
+                meta_fps = float(meta.get("fps", 0.0)) if meta else 0.0
+
+                if meta_fps > 0:
+
+                    fps = meta_fps
+
+                elif clip.input_asset is not None and clip.input_asset.asset_type == "video":
+
+                    import cv2
+
+                    from backend.frame_io import open_video
+
+                    cap = open_video(clip.input_asset.path)
+
+                    try:
+
+                        if cap.isOpened():
+
+                            cap_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+
+                            if 0.0 < cap_fps <= 240.0:
+
+                                fps = cap_fps
+
+                    finally:
+
+                        cap.release()
+
+            except Exception:
+
+                pass
+
+            self._scrubber.set_fps(fps)
+
             self._scrubber.set_range(fi.frame_count)
 
             if fi.frame_count > 0:
 
-                self._scrubber.set_frame(0)
+                if same_clip:
+                    target_frame = max(0, min(prev_frame, fi.frame_count - 1))
+                elif clip.in_out_range is not None:
+                    target_frame = max(0, min(int(clip.in_out_range.in_point), fi.frame_count - 1))
+                else:
+                    target_frame = 0
+
+                self._scrubber.set_frame(target_frame)
 
             self._update_coverage(clip, fi)
 
@@ -409,6 +537,7 @@ class DualViewerPanel(QWidget):
             target = max(0, min(frame_index - 1, fi.frame_count - 1))
 
             self._scrubber.set_frame(target)
+            self._input_viewer.navigate_to_frame(target)
 
             if self._clip:
 
@@ -490,6 +619,32 @@ class DualViewerPanel(QWidget):
 
             self._load_wipe_images()
 
+    def set_live_preview_modes(self, enabled: bool) -> None:
+
+        """Enable or disable live SAM 3.1 view modes (MASK/ALPHA/COMP) on the output viewer."""
+
+        self._sam3_live_modes = {ViewMode.MASK, ViewMode.ALPHA, ViewMode.COMP} if enabled else set()
+
+        self._output_viewer.set_live_preview_modes(self._sam3_live_modes | self._render_live_modes)
+
+    def set_live_render_modes(self, enabled: bool) -> None:
+
+        """Enable or disable live CorridorKey render modes (FG/MATTE/COMP/PROC) in memory."""
+
+        self._render_live_modes = (
+            {ViewMode.FG, ViewMode.MATTE, ViewMode.COMP, ViewMode.PROCESSED}
+            if enabled
+            else set()
+        )
+
+        self._output_viewer.set_live_preview_modes(self._sam3_live_modes | self._render_live_modes)
+
+    def clear_live_preview(self) -> None:
+
+        """Release the live preview hold on the output viewer so disk/input decodes can paint."""
+
+        self._output_viewer.clear_live_preview()
+
 
 
     def reset_zoom(self) -> None:
@@ -500,13 +655,29 @@ class DualViewerPanel(QWidget):
 
         self._output_viewer.reset_zoom()
 
+        self._wipe_overlay.reset_zoom()
 
+
+
+    def set_busy(self, active: bool, message: str = "", progress: float | None = None) -> None:
+        """Show or hide the centered Battle.net orbital busy indicator overlay."""
+        if not hasattr(self, "_busy_overlay"):
+            return
+        if active:
+            self._busy_overlay.show_busy(message, progress=progress)
+        else:
+            self._busy_overlay.hide_busy()
 
     def set_extraction_progress(self, progress: float, total: int) -> None:
 
-        """Forward extraction progress to the input viewer's split view."""
+        """Display extraction progress via the Battle.net orbital busy overlay."""
 
-        self._input_viewer._split_view.set_extraction_progress(progress, total)
+        self._input_viewer._split_view.set_extraction_progress(0.0, 0)
+        if total > 0:
+            pct = max(0, min(100, int(progress * 100)))
+            self.set_busy(True, self.tr("Extracting frames... %d%%") % pct, progress=progress)
+        else:
+            self.set_busy(False)
 
 
 
@@ -592,6 +763,10 @@ class DualViewerPanel(QWidget):
 
         self._output_viewer.navigate_to_frame(stem_index)
 
+        if self._wipe_active:
+
+            self._load_wipe_images()
+
         self.frame_changed.emit(stem_index)
 
 
@@ -636,6 +811,8 @@ class DualViewerPanel(QWidget):
 
         if self._wipe_active:
 
+            self._wipe_overlay.set_view_transform(*self._output_viewer._split_view.view_transform())
+
             self._load_wipe_images()
 
             self._position_wipe_overlay()
@@ -646,7 +823,83 @@ class DualViewerPanel(QWidget):
 
         else:
 
+            self._snapshot_image = None
+
+            self._snap_button.setChecked(False)
+
             self._wipe_overlay.hide()
+
+    def set_active_object_id(self, object_id: int) -> None:
+
+        self._input_viewer.set_active_object_id(object_id)
+
+    def set_polygon_model(self, model) -> None:
+
+        self._input_viewer.set_polygon_model(model)
+
+        self._output_viewer.set_polygon_model(model)
+
+        self._wipe_overlay.set_polygon_model(model)
+
+    def set_alpha_probe_array(self, alpha_arr) -> None:
+
+        self._output_viewer.set_alpha_probe_array(alpha_arr)
+
+        self._wipe_overlay.set_alpha_probe_array(alpha_arr)
+
+    def freeze_snapshot(self, enable: bool | None = None) -> bool:
+
+        """Freeze current output image as Side A in A/B wipe comparison against live Side B."""
+
+        target = (self._snapshot_image is None) if enable is None else bool(enable)
+
+        if target:
+
+            sv = self._output_viewer._split_view
+
+            out_img = sv._right_image if sv.split_enabled else (sv._single_image or sv._right_image)
+
+            if out_img is None or out_img.isNull():
+
+                self._snap_button.setChecked(False)
+
+                return False
+
+            self._snapshot_image = out_img.copy()
+
+            self._snap_button.setChecked(True)
+
+            if not self._wipe_active:
+
+                self._wipe_active = True
+
+                self._ab_button.setChecked(True)
+
+                self._wipe_overlay.set_view_transform(*self._output_viewer._split_view.view_transform())
+
+                self._position_wipe_overlay()
+
+                self._wipe_overlay.show()
+
+                self._wipe_overlay.raise_()
+
+            self._load_wipe_images()
+
+            return True
+
+        self._snapshot_image = None
+
+        self._snap_button.setChecked(False)
+
+        if self._wipe_active:
+
+            self._load_wipe_images()
+
+        return False
+
+    def toggle_snapshot_compare(self) -> None:
+
+        self.freeze_snapshot()
 
 
 
@@ -684,6 +937,10 @@ class DualViewerPanel(QWidget):
 
             self._position_wipe_overlay()
 
+        if hasattr(self, "_busy_overlay") and self._busy_overlay.isVisible():
+
+            self._busy_overlay.recenter()
+
 
 
     @Slot(int, str, object)
@@ -691,6 +948,16 @@ class DualViewerPanel(QWidget):
     def _on_wipe_frame_ready(self, stem_index: int, mode_value: str, qimage: object) -> None:
 
         """A viewer decoded a frame — refresh wipe if active."""
+
+        if self._wipe_active:
+
+            self._load_wipe_images()
+
+    @Slot(str)
+
+    def _on_backdrop_changed_wipe(self, _backdrop: str) -> None:
+
+        """Refresh wipe image if backdrop changed while wipe is open."""
 
         if self._wipe_active:
 
@@ -710,11 +977,11 @@ class DualViewerPanel(QWidget):
 
         output_img = self._output_viewer._split_view._single_image
 
+        left_img = self._snapshot_image if (self._snapshot_image is not None and not self._snapshot_image.isNull()) else input_img
 
+        if left_img:
 
-        if input_img:
-
-            self._wipe_overlay.set_left_image(input_img)
+            self._wipe_overlay.set_left_image(left_img)
 
         if output_img:
 

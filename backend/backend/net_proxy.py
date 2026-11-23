@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import threading
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
@@ -51,49 +52,62 @@ def _socks5_available() -> bool:
         return False
 
 
+_PROXY_LOCK = threading.Lock()
+_PROXY_DEPTH = 0
+_PROXY_SAVED: dict[str, str] = {}
+
+
 @contextmanager
 def sanitized_proxy_env():
     """Temporarily rewrite socks4 proxy env vars so httpx can use them.
 
-    Never raises: on any inspection error the environment is left as-is.
-    Restores every touched variable on exit, including after exceptions.
+    Thread-safe via reference counting across concurrent downloads.
     """
-    original: dict[str, str] = {}
-    try:
-        upgrade = _socks5_available()
-        for var in _PROXY_VARS:
-            value = os.environ.get(var)
-            if not value:
-                continue
-            lowered = value.strip().lower()
-            if not lowered.startswith(_SOCKS4_SCHEMES):
-                continue
-            original[var] = value
-            if upgrade:
-                scheme_len = len(lowered.split("://", 1)[0])
-                rewritten = "socks5://" + value.strip()[scheme_len + 3:]
-                os.environ[var] = rewritten
-                logger.warning(
-                    "Proxy %s=%s uses socks4, which model downloads do not "
-                    "support. Using %s for this download (V2Ray-family "
-                    "clients accept both on the same port).",
-                    var, value, rewritten,
-                )
-            else:
-                del os.environ[var]
-                logger.warning(
-                    "Proxy %s=%s uses socks4, which model downloads do not "
-                    "support, and socks5 support is unavailable. Ignoring "
-                    "this proxy for the download.",
-                    var, value,
-                )
-    except Exception:
-        logger.exception("Proxy sanitation failed; leaving environment untouched")
+    global _PROXY_DEPTH
+    with _PROXY_LOCK:
+        if _PROXY_DEPTH == 0:
+            _PROXY_SAVED.clear()
+            try:
+                upgrade = _socks5_available()
+                for var in _PROXY_VARS:
+                    value = os.environ.get(var)
+                    if not value:
+                        continue
+                    lowered = value.strip().lower()
+                    if not lowered.startswith(_SOCKS4_SCHEMES):
+                        continue
+                    _PROXY_SAVED[var] = value
+                    if upgrade:
+                        scheme_len = len(lowered.split("://", 1)[0])
+                        rewritten = "socks5://" + value.strip()[scheme_len + 3:]
+                        os.environ[var] = rewritten
+                        logger.warning(
+                            "Proxy %s=%s uses socks4, which model downloads do not "
+                            "support. Using %s for this download (V2Ray-family "
+                            "clients accept both on the same port).",
+                            var, value, rewritten,
+                        )
+                    else:
+                        del os.environ[var]
+                        logger.warning(
+                            "Proxy %s=%s uses socks4, which model downloads do not "
+                            "support, and socks5 support is unavailable. Ignoring "
+                            "this proxy for the download.",
+                            var, value,
+                        )
+            except Exception:
+                logger.exception("Proxy sanitation failed; leaving environment untouched")
+        _PROXY_DEPTH += 1
     try:
         yield
     finally:
-        for var, value in original.items():
-            os.environ[var] = value
+        with _PROXY_LOCK:
+            _PROXY_DEPTH -= 1
+            if _PROXY_DEPTH <= 0:
+                _PROXY_DEPTH = 0
+                for var, value in _PROXY_SAVED.items():
+                    os.environ[var] = value
+                _PROXY_SAVED.clear()
 
 
 def friendly_proxy_error(exc: BaseException) -> str | None:

@@ -39,6 +39,7 @@ class AnnotationStroke:
     points: list[tuple[float, float]] = field(default_factory=list)
     brush_type: str = "fg"   # "fg" (foreground/keep) or "bg" (background/remove)
     radius: float = 15.0     # brush radius in image pixels
+    object_id: int = 1       # multi-subject SAM 3.1 object ID (1..4)
 
 
 class AnnotationModel:
@@ -47,18 +48,22 @@ class AnnotationModel:
     def __init__(self, filename: str = "annotations.json") -> None:
         # stem_index -> list of completed strokes
         self._strokes: dict[int, list[AnnotationStroke]] = {}
+        # stem_index -> stack of undone strokes for Redo
+        self._redo_stack: dict[int, list[AnnotationStroke]] = {}
         # In-progress stroke (not yet finished)
         self._current_stroke: AnnotationStroke | None = None
         self._current_frame: int = -1
         self._FILENAME = filename
 
     def start_stroke(self, stem_idx: int, x: float, y: float,
-                     brush_type: str, radius: float) -> None:
+                     brush_type: str, radius: float,
+                     object_id: int = 1) -> None:
         """Begin a new stroke on the given frame."""
         self._current_stroke = AnnotationStroke(
             points=[(x, y)],
             brush_type=brush_type,
             radius=radius,
+            object_id=max(1, int(object_id)),
         )
         self._current_frame = stem_idx
 
@@ -73,6 +78,7 @@ class AnnotationModel:
             if len(self._current_stroke.points) >= 1:
                 strokes = self._strokes.setdefault(self._current_frame, [])
                 strokes.append(self._current_stroke)
+                self._redo_stack.pop(self._current_frame, None)
         self._current_stroke = None
 
     @property
@@ -108,21 +114,41 @@ class AnnotationModel:
         return False
 
     def undo(self, stem_idx: int) -> bool:
-        """Pop the last stroke on a frame. Returns True if a stroke was removed."""
+        """Pop the last stroke on a frame onto the redo stack. Returns True if removed."""
         strokes = self._strokes.get(stem_idx)
         if strokes:
-            strokes.pop()
+            popped = strokes.pop()
+            self._redo_stack.setdefault(stem_idx, []).append(popped)
             if not strokes:
                 del self._strokes[stem_idx]
             return True
         return False
 
+    def redo(self, stem_idx: int) -> bool:
+        """Restore the most recently undone stroke on a frame."""
+        stack = self._redo_stack.get(stem_idx)
+        if stack:
+            restored = stack.pop()
+            if not stack:
+                del self._redo_stack[stem_idx]
+            self._strokes.setdefault(stem_idx, []).append(restored)
+            return True
+        return False
+
+    def can_undo(self, stem_idx: int) -> bool:
+        return bool(self._strokes.get(stem_idx))
+
+    def can_redo(self, stem_idx: int) -> bool:
+        return bool(self._redo_stack.get(stem_idx))
+
     def clear(self, stem_idx: int | None = None) -> None:
         """Clear annotations for one frame or all frames."""
         if stem_idx is not None:
             self._strokes.pop(stem_idx, None)
+            self._redo_stack.pop(stem_idx, None)
         else:
             self._strokes.clear()
+            self._redo_stack.clear()
         self._current_stroke = None
 
     def get_strokes(self, stem_idx: int) -> list[AnnotationStroke]:
@@ -151,13 +177,14 @@ class AnnotationModel:
                     "points": s.points,
                     "brush_type": s.brush_type,
                     "radius": s.radius,
+                    "object_id": getattr(s, "object_id", 1),
                 }
                 for s in strokes
             ]
         path = os.path.join(clip_root, self._FILENAME)
         try:
             if data:
-                with open(path, "w") as f:
+                with open(path, "w", encoding="utf-8") as f:
                     json.dump(data, f)
             elif os.path.isfile(path):
                 os.remove(path)
@@ -167,6 +194,7 @@ class AnnotationModel:
     def load(self, clip_root: str) -> None:
         """Load strokes from {clip_root}/annotations.json if it exists."""
         self._strokes.clear()
+        self._redo_stack.clear()
         self._current_stroke = None
         if not clip_root:
             return
@@ -174,7 +202,7 @@ class AnnotationModel:
         if not os.path.isfile(path):
             return
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for idx_str, stroke_list in data.items():
                 idx = int(idx_str)
@@ -183,17 +211,18 @@ class AnnotationModel:
                         points=[tuple(p) for p in s["points"]],
                         brush_type=s.get("brush_type", "fg"),
                         radius=s.get("radius", 15.0),
+                        object_id=max(1, int(s.get("object_id", 1))),
                     )
                     for s in stroke_list
                 ]
             logger.info(f"Loaded annotations for {len(self._strokes)} frames from {path}")
-        except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as e:
             logger.warning(f"Failed to load annotations: {e}")
 
     def export_masks(self, clip_root: str, frame_stems: list[str],
                      width: int, height: int,
                      start_index: int = 0) -> str:
-        """Rasterize annotations to binary mask PNGs for VideoMamaMaskHint.
+        """Rasterize annotations to binary mask PNGs for SamMaskHint.
 
         Args:
             clip_root: Path to clip directory.
@@ -204,9 +233,9 @@ class AnnotationModel:
                          when exporting a sub-range via in/out points).
 
         Returns:
-            Path to the created VideoMamaMaskHint directory.
+            Path to the created SamMaskHint directory.
         """
-        mask_dir = os.path.join(clip_root, "VideoMamaMaskHint")
+        mask_dir = os.path.join(clip_root, "SamMaskHint")
         os.makedirs(mask_dir, exist_ok=True)
 
         for i, stem in enumerate(frame_stems):
@@ -238,6 +267,15 @@ class AnnotationModel:
         mask = np.zeros((height, width), dtype=np.uint8)
 
         for stroke in strokes:
+            if stroke.brush_type == "box":
+                if len(stroke.points) >= 2:
+                    xs = [p[0] for p in stroke.points]
+                    ys = [p[1] for p in stroke.points]
+                    x1, y1 = int(round(min(xs))), int(round(min(ys)))
+                    x2, y2 = int(round(max(xs))), int(round(max(ys)))
+                    cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+                continue
+
             color = 255 if stroke.brush_type in ("fg", "hair") else 0
             radius = max(1, int(round(stroke.radius)))
 
@@ -268,6 +306,15 @@ class AnnotationModel:
         mask = np.full((height, width), 128, dtype=np.uint8)
 
         for stroke in strokes:
+            if stroke.brush_type == "box":
+                if len(stroke.points) >= 2:
+                    xs = [p[0] for p in stroke.points]
+                    ys = [p[1] for p in stroke.points]
+                    x1, y1 = int(round(min(xs))), int(round(min(ys)))
+                    x2, y2 = int(round(max(xs))), int(round(max(ys)))
+                    cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+                continue
+
             color = 255 if stroke.brush_type in ("fg", "hair") else 0
             radius = max(1, int(round(stroke.radius)))
 
@@ -332,28 +379,57 @@ def paint_annotations(painter: QPainter, strokes: list[AnnotationStroke],
     if current_stroke is not None:
         all_strokes.append(current_stroke)
 
-    if not all_strokes:
+    if not all_strokes or img_w <= 0 or img_h <= 0:
         return
 
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing)
 
     for stroke in all_strokes:
-        if stroke.brush_type == "hair":
-            color = _HAIR_COLOR
-        elif stroke.brush_type == "fg":
-            color = get_fg_color()
-        else:
-            color = _BG_COLOR
-
-        # Scale radius from image pixels to display pixels
-        display_radius = stroke.radius * image_rect.width() / img_w
-
         display_pts = []
         for px, py in stroke.points:
             dx = image_rect.x() + (px / img_w) * image_rect.width()
             dy = image_rect.y() + (py / img_h) * image_rect.height()
             display_pts.append(QPointF(dx, dy))
+
+        if stroke.brush_type == "box":
+            obj_id = max(1, int(getattr(stroke, "object_id", 1)))
+            box_colors = {
+                1: QColor(255, 242, 3, 230),
+                2: QColor(65, 165, 255, 230),
+                3: QColor(255, 145, 50, 230),
+                4: QColor(225, 95, 255, 230),
+            }
+            box_col = box_colors.get(obj_id, QColor(255, 242, 3, 230))
+            if len(display_pts) >= 2:
+                rect = QRectF(display_pts[0], display_pts[-1]).normalized()
+                pen = QPen(box_col, 2.0, Qt.DashLine)
+                painter.setPen(pen)
+                painter.setBrush(QColor(box_col.red(), box_col.green(), box_col.blue(), 35))
+                painter.drawRect(rect)
+            elif len(display_pts) == 1:
+                pen = QPen(box_col, 2.0)
+                painter.setPen(pen)
+                painter.drawEllipse(display_pts[0], 4.0, 4.0)
+            continue
+
+        obj_id = max(1, int(getattr(stroke, "object_id", 1)))
+        if stroke.brush_type == "hair":
+            color = _HAIR_COLOR
+        elif stroke.brush_type == "fg":
+            if obj_id == 1:
+                color = get_fg_color()
+            elif obj_id == 2:
+                color = QColor(50, 140, 255, 140)
+            elif obj_id == 3:
+                color = QColor(255, 145, 50, 140)
+            else:
+                color = QColor(225, 95, 255, 140)
+        else:
+            color = _BG_COLOR
+
+        # Scale radius from image pixels to display pixels
+        display_radius = stroke.radius * image_rect.width() / img_w
 
         if outline_only:
             # Outline mode: unfilled circles + thin connecting lines

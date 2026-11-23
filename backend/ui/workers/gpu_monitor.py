@@ -1,11 +1,7 @@
-"""GPU monitor — polls VRAM usage and GPU info via QTimer.
+"""GPU monitor — non-blocking background thread VRAM/memory poller.
 
-Design decisions (from Codex review):
-- Uses pynvml (NVML) for VRAM display, not torch.cuda calls
-- Falls back to torch.cuda only if NVML unavailable
-- Apple Silicon: reports unified memory via psutil (GPU shares system RAM)
-- Polling interval: 2000ms (not too aggressive on GPU queries)
-- Emits lightweight dict signal, QPixmap/rendering stays on main thread
+Moves NVML/CUDA probing and periodic telemetry off the main Qt event loop
+so window creation stays responsive and never hitches on driver queries.
 """
 from __future__ import annotations
 
@@ -13,99 +9,123 @@ import logging
 import platform
 import subprocess
 import sys
+import threading
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, Signal
 
 logger = logging.getLogger(__name__)
 
 
 class GPUMonitor(QObject):
-    """Polls GPU VRAM usage periodically and emits updates.
-
-    Signal data dict keys:
-        name: str — GPU name (e.g. "NVIDIA GeForce RTX 4090")
-        total_gb: float — Total VRAM in GB
-        used_gb: float — Used VRAM in GB
-        free_gb: float — Free VRAM in GB
-        usage_pct: float — Usage percentage (0-100)
-        available: bool — Whether GPU monitoring is available
-    """
+    """Polls GPU VRAM / unified memory periodically on a daemon thread."""
 
     vram_updated = Signal(dict)  # GPU info dict
     gpu_name = Signal(str)       # emitted once on first successful poll
 
     def __init__(self, interval_ms: int = 2000, parent=None):
         super().__init__(parent)
-        self._timer = QTimer(self)
-        self._timer.setInterval(interval_ms)
-        self._timer.timeout.connect(self._poll)
+        self._interval_sec = max(0.25, float(interval_ms) / 1000.0)
         self._nvml_available = False
         self._nvml_handle = None
         self._torch_fallback = False
         self._apple_silicon = False
         self._apple_chip_name: str | None = None
         self._name_emitted = False
-        self._init_nvml()
+        self._initialized = False
+
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
 
     def _init_nvml(self) -> None:
-        """Try to initialize NVML for GPU monitoring."""
+        """Initialize telemetry backend (called lazily inside background thread)."""
+        self._initialized = True
         try:
             import pynvml
             pynvml.nvmlInit()
             self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             self._nvml_available = True
             logger.info("GPU monitor: using NVML")
+            return
         except Exception:
             self._nvml_available = False
-            # Check torch fallback
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    self._torch_fallback = True
-                    logger.info("GPU monitor: NVML unavailable, using torch.cuda fallback")
-                    return
-            except ImportError:
-                pass
 
-            # Check Apple Silicon — unified memory IS the GPU memory
-            if sys.platform == "darwin" and platform.machine() == "arm64":
-                self._apple_silicon = True
-                self._apple_chip_name = self._detect_apple_chip()
-                logger.info("GPU monitor: Apple Silicon (%s), reporting unified memory",
-                            self._apple_chip_name or "unknown chip")
-            else:
-                logger.info("GPU monitor: no GPU monitoring available")
+        # Apple Silicon: unified memory reported via psutil without touching torch
+        if sys.platform == "darwin" and platform.machine() == "arm64":
+            self._apple_silicon = True
+            self._apple_chip_name = self._detect_apple_chip()
+            logger.info(
+                "GPU monitor: Apple Silicon (%s), reporting unified memory",
+                self._apple_chip_name or "unknown chip",
+            )
+            return
+
+        # Delay any torch fallback slightly so UI boot finishes before torch loads
+        if self._stop_event.wait(0.25):
+            return
+        try:
+            import torch
+            if torch.cuda.is_available():
+                self._torch_fallback = True
+                logger.info("GPU monitor: NVML unavailable, using torch.cuda fallback")
+                return
+        except ImportError:
+            pass
+
+        logger.info("GPU monitor: no GPU monitoring available")
 
     def start(self) -> None:
-        """Start polling."""
-        self._poll()  # immediate first poll
-        self._timer.start()
+        """Start background GPU monitoring thread (non-blocking)."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name="CorridorKey-GPUMonitor",
+            daemon=True,
+        )
+        self._thread.start()
 
     def stop(self) -> None:
-        """Stop polling."""
-        self._timer.stop()
+        """Stop background polling cleanly."""
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        self._thread = None
+
+    def _worker_loop(self) -> None:
+        if not self._initialized:
+            self._init_nvml()
+        while not self._stop_event.is_set():
+            self._poll()
+            if self._stop_event.wait(self._interval_sec):
+                break
 
     def _poll(self) -> None:
-        """Query GPU status and emit signal."""
+        """Query GPU status and emit signal if still running."""
+        if self._stop_event.is_set():
+            return
+        if not self._initialized:
+            self._init_nvml()
+        if self._stop_event.is_set():
+            return
         info = self._query_gpu()
+        if self._stop_event.is_set():
+            return
         self.vram_updated.emit(info)
-
         if info.get("available") and not self._name_emitted:
-            self.gpu_name.emit(info.get("name", "GPU"))
             self._name_emitted = True
+            self.gpu_name.emit(info.get("name", "GPU"))
 
     def _query_gpu(self) -> dict:
-        """Get GPU VRAM info from NVML, torch, or Apple Silicon unified memory."""
         if self._nvml_available:
             return self._query_nvml()
-        elif self._torch_fallback:
+        if self._torch_fallback:
             return self._query_torch()
-        elif self._apple_silicon:
+        if self._apple_silicon:
             return self._query_apple_silicon()
         return {"available": False}
 
     def _query_nvml(self) -> dict:
-        """Query via NVML (preferred — no CUDA context interference)."""
         try:
             import pynvml
             mem = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
@@ -128,7 +148,6 @@ class GPUMonitor(QObject):
             return {"available": False}
 
     def _query_torch(self) -> dict:
-        """Fallback: query via torch.cuda (may contend with inference)."""
         try:
             import torch
             props = torch.cuda.get_device_properties(0)
@@ -152,22 +171,18 @@ class GPUMonitor(QObject):
 
     @staticmethod
     def _detect_apple_chip() -> str | None:
-        """Get Apple chip name (e.g. 'Apple M3 Max') via sysctl."""
         try:
             result = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             return result.stdout.strip() or None
         except Exception:
             return None
 
     def _query_apple_silicon(self) -> dict:
-        """Report unified memory usage on Apple Silicon.
-
-        On Apple Silicon, system RAM IS the GPU memory — there's no
-        separate VRAM. psutil.virtual_memory() reports the shared pool.
-        """
         try:
             import psutil
             mem = psutil.virtual_memory()

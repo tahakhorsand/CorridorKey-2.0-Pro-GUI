@@ -37,8 +37,8 @@ from .metadata import (
     read_video_metadata,
     write_video_metadata,
 )
-from .probe import probe_video
-from .stitching import stitch_video
+from .probe import probe_video, probe_audio_and_timecode
+from .stitching import build_stitch_command, stitch_video
 
 __all__ = [
     # discovery
@@ -53,6 +53,7 @@ __all__ = [
     "validate_ffmpeg_install",
     # probe
     "probe_video",
+    "probe_audio_and_timecode",
     # color
     "build_exr_vf",
     # extraction
@@ -60,6 +61,7 @@ __all__ = [
     "_recompress_to_dwab",
     "extract_frames",
     # stitching
+    "build_stitch_command",
     "stitch_video",
     # metadata
     "write_video_metadata",

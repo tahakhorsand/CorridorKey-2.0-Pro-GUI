@@ -50,24 +50,19 @@ DEFAULT_MODEL = "Matting"
 
 
 def _sync_local_birefnet_caches(hub_dir: Path) -> None:
-    """Ensure any pre-populated BiRefNet snapshots on E:\\ComfyUI are mirrored into hub_dir."""
-    try:
-        comfy_biref = Path(r"E:\ComfyUI\ComfyUI\models\birefnet\models--ZhengPeng7--BiRefNet")
-        target = hub_dir / "models--ZhengPeng7--BiRefNet"
-        if comfy_biref.is_dir():
-            src_snaps = comfy_biref / "snapshots"
-            dst_snaps = target / "snapshots"
-            if src_snaps.is_dir() and not dst_snaps.is_dir():
-                shutil.copytree(comfy_biref, target, dirs_exist_ok=True)
-    except Exception as e:
-        logger.debug("BiRefNet cache sync skipped: %s", e)
+    """Optional hook for synchronizing local BiRefNet hub caches."""
+    return
 
 
 def resolve_birefnet_snapshot(repo_id: str, cache_dir: Path = DEFAULT_HF_HUB_DIR) -> Optional[Path]:
     """Return the local snapshot folder if model.safetensors exists locally."""
     _sync_local_birefnet_caches(cache_dir)
     folder_name = "models--" + repo_id.replace("/", "--")
-    for root in (cache_dir, Path(r"E:\ComfyUI\ComfyUI\models\birefnet")):
+    env_dir = os.environ.get("BIREFNET_CACHE_DIR", "").strip()
+    roots = [cache_dir]
+    if env_dir:
+        roots.append(Path(env_dir))
+    for root in roots:
         snaps_root = root / folder_name / "snapshots"
         if snaps_root.is_dir():
             for snap in sorted(snaps_root.iterdir()):

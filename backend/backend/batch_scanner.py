@@ -95,7 +95,8 @@ def scan_batch_folder(folder: str) -> list[BatchClipInfo]:
             if h_path in used_hints:
                 continue
             h_stem = _entry_stem(h_path, _h_is_dir).lower()
-            if stem_lower not in h_stem:
+            import re as _re
+            if not _re.search(rf"(?:^|[\s_\-.]){_re.escape(stem_lower)}(?:$|[\s_\-.])", h_stem):
                 continue
             if h_kw == "alphahint" and alpha_path is None:
                 alpha_path = h_path

@@ -195,6 +195,8 @@ def handle_wipe_drag(
         dx = event_pos.x() - drag_start.x()
         dy = event_pos.y() - drag_start.y()
         diag = math.sqrt(width ** 2 + height ** 2)
+        if diag <= 1e-6:
+            return start_offset, wipe_angle
         delta_offset = (dx * nx + dy * ny) / diag
         new_offset = max(-0.5, min(0.5, start_offset + delta_offset))
         return new_offset, wipe_angle
@@ -208,7 +210,7 @@ def handle_wipe_drag(
             angle = 90.0
         elif angle < -90.0:
             angle = -90.0
-        return wipe_angle, angle  # offset unchanged, angle changed
+        return start_offset, angle  # offset unchanged, angle changed
 
     return start_offset, wipe_angle  # no-op fallback
 

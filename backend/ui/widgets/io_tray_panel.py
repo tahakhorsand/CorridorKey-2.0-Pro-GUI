@@ -45,6 +45,10 @@ class IOTrayPanel(IOTrayActionsMixin, QWidget):
     image_files_dropped = Signal(list)  # list of image file paths (for <5 popup)
     extract_requested = Signal(list) # list[ClipEntry] — re-run extraction
     export_video_requested = Signal(object, str)  # ClipEntry, source_dir — export as video
+    export_nuke_requested = Signal(object)       # ClipEntry — export .nk script
+    export_fcpxml_requested = Signal(object)     # ClipEntry — export .fcpxml timeline
+    export_ae_requested = Signal(object)         # ClipEntry — export After Effects .jsx
+    export_fusion_requested = Signal(object)     # ClipEntry — export DaVinci Fusion .comp
     reset_in_out_requested = Signal()  # clear all in/out markers
 
     def __init__(self, model: ClipListModel, parent=None):
@@ -260,13 +264,11 @@ class IOTrayPanel(IOTrayActionsMixin, QWidget):
                 self.sequence_folder_imported.emit(folder)
             else:
                 self.clips_dir_changed.emit(folder)
-        elif video_files and not image_files:
+        if video_files:
             self.files_imported.emit(video_files)
-        elif image_files:
+        if image_files:
             # Image files dropped — emit for popup handling in main_window
             self.image_files_dropped.emit(image_files)
-        elif video_files:
-            self.files_imported.emit(video_files)
 
     # ── Single / Multi-select management ──
 

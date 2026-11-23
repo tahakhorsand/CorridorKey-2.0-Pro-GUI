@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QKeyCombination, Qt
 from PySide6.QtGui import QKeySequence, QKeyEvent
 
-from ui.shortcut_registry import ShortcutRegistry, CATEGORY_ORDER
+from ui.shortcut_registry import ShortcutRegistry, CATEGORY_ORDER, KEYMAP_PRESETS
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,8 @@ class KeyBindButton(QPushButton):
         # Check conflicts
         conflicts = self._registry.find_conflicts(self.action_id, key_str)
         if conflicts:
+            self._recording = False
+            self.releaseKeyboard()
             conflict_names = ", ".join(
                 d.display_name for d in self._registry.definitions()
                 if d.action_id in conflicts
@@ -97,15 +99,16 @@ class KeyBindButton(QPushButton):
                 QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
-                self._cancel_recording()
+                self.display_key(self._registry.get_key(self.action_id))
                 return
             # Clear conflicting bindings
             for cid in conflicts:
                 self._registry.set_key(cid, "")
                 self._dialog.refresh_button(cid)
+        else:
+            self._recording = False
+            self.releaseKeyboard()
 
-        self._recording = False
-        self.releaseKeyboard()
         self._registry.set_key(self.action_id, key_str)
         self.display_key(key_str)
 
@@ -139,6 +142,23 @@ class HotkeysDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
         layout.setContentsMargins(12, 12, 12, 12)
+
+        # Preset selector bar + Filter bar
+        from PySide6.QtWidgets import QComboBox
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(6)
+        preset_lbl = QLabel(self.tr("Keymap Preset:"))
+        preset_lbl.setStyleSheet("color: #999980; font-size: 11px;")
+        preset_row.addWidget(preset_lbl)
+        self._preset_combo = QComboBox()
+        for pname in KEYMAP_PRESETS.keys():
+            self._preset_combo.addItem(pname)
+        preset_row.addWidget(self._preset_combo, 1)
+        apply_preset_btn = QPushButton(self.tr("Apply Preset"))
+        apply_preset_btn.setCursor(Qt.PointingHandCursor)
+        apply_preset_btn.clicked.connect(self._on_apply_keymap_preset)
+        preset_row.addWidget(apply_preset_btn)
+        layout.addLayout(preset_row)
 
         # Filter bar
         self._filter = QLineEdit()
@@ -304,6 +324,12 @@ class HotkeysDialog(QDialog):
         self._registry.reset_key(action_id)
         self.refresh_button(action_id)
 
+    def _on_apply_keymap_preset(self) -> None:
+        name = self._preset_combo.currentText()
+        self._registry.apply_preset(name)
+        for action_id in self._buttons:
+            self.refresh_button(action_id)
+
     def _reset_all(self) -> None:
         reply = QMessageBox.question(
             self, self.tr("Reset All Shortcuts"),
@@ -317,9 +343,13 @@ class HotkeysDialog(QDialog):
                 self.refresh_button(action_id)
 
     def _on_cancel(self) -> None:
-        """Revert all in-memory changes and close."""
-        self._registry.restore_overrides(self._original_overrides)
+        """Cancel button -> reject (reverts in-memory changes)."""
         self.reject()
+
+    def reject(self) -> None:
+        """Revert all in-memory shortcut changes when cancelled or closed via Esc."""
+        self._registry.restore_overrides(self._original_overrides)
+        super().reject()
 
     def _on_accept(self) -> None:
         """Save overrides and close."""

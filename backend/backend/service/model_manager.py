@@ -164,6 +164,17 @@ class ModelManagerMixin:
 
         """Aggressively offload all GPU models and empty CUDA cache so VRAM drops to ~0 MB."""
 
+        lock = getattr(self, "_gpu_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            self._release_vram_locked(keep_corridorkey_cpu_cache=keep_corridorkey_cpu_cache)
+        finally:
+            if lock is not None:
+                lock.release()
+
+    def _release_vram_locked(self, keep_corridorkey_cpu_cache: bool = True) -> None:
+
         vram_before = self._vram_reserved_mb()
 
         for eng in getattr(self, "_engine_pool", []):
@@ -254,17 +265,30 @@ class ModelManagerMixin:
 
         if self._active_model == _ActiveModel.INFERENCE and needed != _ActiveModel.INFERENCE:
 
-            with self._gate_lock:
-
-                self._switch_pending = True
-
-            if not self._inference_idle.wait(timeout=300):
-
-                logger.warning("Timed out waiting for inference sessions to drain")
-
-            with self._gate_lock:
-
-                self._switch_pending = False
+            cond = getattr(self, "_gate_cond", None)
+            if cond is not None:
+                with cond:
+                    self._switch_pending = True
+                    try:
+                        deadline = time.monotonic() + 300.0
+                        while self._inference_active > 0:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                logger.warning("Timed out waiting for inference sessions to drain")
+                                break
+                            cond.wait(timeout=min(1.0, remaining))
+                    finally:
+                        self._switch_pending = False
+                        cond.notify_all()
+            else:
+                with self._gate_lock:
+                    self._switch_pending = True
+                try:
+                    if not self._inference_idle.wait(timeout=300):
+                        logger.warning("Timed out waiting for inference sessions to drain")
+                finally:
+                    with self._gate_lock:
+                        self._switch_pending = False
 
 
 

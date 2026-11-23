@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import QMessageBox
-
+from PySide6.QtCore import Qt
 from . import _tr
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QKeySequence, QShortcut
 
 
 class ShortcutsMixin:
@@ -12,8 +12,18 @@ class ShortcutsMixin:
     def _setup_shortcuts(self) -> None:
         """Wire keyboard shortcuts from the centralized registry."""
         self._shortcut_registry.create_shortcuts(self)
-        # Sync menu-bar QAction shortcuts (display text + activation)
+        # Secondary Redo shortcut (Ctrl+Shift+Z) if not assigned to another action
+        old_redo = getattr(self, "_redo_secondary_shortcut", None)
+        if old_redo is not None:
+            old_redo.deleteLater()
+            self._redo_secondary_shortcut = None
         reg = self._shortcut_registry
+        if not reg.find_conflicts("__secondary_redo__", "Ctrl+Shift+Z"):
+            sc = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(self._redo_annotation)
+            self._redo_secondary_shortcut = sc
+        # Sync menu-bar QAction shortcuts (display text + activation)
         self._save_action.setShortcut(QKeySequence(reg.get_key("save_session")))
         self._open_action.setShortcut(QKeySequence(reg.get_key("open_project")))
         self._prefs_action.setShortcut(QKeySequence(reg.get_key("preferences")))
@@ -257,10 +267,12 @@ class ShortcutsMixin:
         if iv.annotation_mode == 'eraser':
             iv.set_annotation_mode(None)
             ov.set_annotation_mode(None)
+            self._dual_viewer.set_holdout_active(False)
         else:
             self._deactivate_eyedropper_if_active()
             iv.set_annotation_mode('eraser')
             ov.set_annotation_mode(None)
+            self._dual_viewer.set_holdout_active(False)
 
     def _toggle_box_prompt(self) -> None:
         """Hotkey R: toggle box prompt mode for SAM 3.1."""
@@ -269,7 +281,9 @@ class ShortcutsMixin:
         if iv.annotation_mode == 'box':
             iv.set_annotation_mode(None)
             ov.set_annotation_mode(None)
+            self._dual_viewer.set_holdout_active(False)
         else:
             self._deactivate_eyedropper_if_active()
             iv.set_annotation_mode('box')
             ov.set_annotation_mode(None)
+            self._dual_viewer.set_holdout_active(False)

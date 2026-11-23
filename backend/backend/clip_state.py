@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import glob as glob_module
 import logging
 from dataclasses import dataclass, field
@@ -287,12 +288,15 @@ class ClipEntry:
             return self.custom_output_dir
 
         # 2. Per-project override (from project.json)
+        safe_clip_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", self.name).strip(" .") or self.folder_name or "clip"
+        if ".." in safe_clip_name:
+            safe_clip_name = safe_clip_name.replace("..", "_")
         project_root = self._project_root
         if project_root:
             from .project import load_project_output_dir
             project_dir = load_project_output_dir(project_root)
             if project_dir:
-                return os.path.join(project_dir, self.name)
+                return os.path.join(project_dir, safe_clip_name)
 
         # 3. Global default from QSettings (Qt Core — no UI dependency)
         try:
@@ -305,7 +309,7 @@ class ClipEntry:
                 else:
                     # v1 layout — root_path is the project dir itself
                     project_name = os.path.basename(self.root_path)
-                return os.path.join(global_dir, project_name, self.name)
+                return os.path.join(global_dir, project_name, safe_clip_name)
         except Exception:
             pass
         # 4. Default: Output/ inside clip folder
@@ -417,15 +421,15 @@ class ClipEntry:
         }
 
         stem_sets = []
-        for output_name in enabled:
+        image_outputs = [o for o in enabled if o in ("fg", "matte", "comp", "processed")]
+        for output_name in image_outputs:
             d = dir_map.get(output_name)
-            if d and os.path.isdir(d):
-                stems = {os.path.splitext(f)[0] for f in os.listdir(d) if _is_image_file(f)}
-                if stems:
-                    stem_sets.append(stems)
-            else:
-                # If this output is a video or optional without an image directory, skip it
-                continue
+            if not d or not os.path.isdir(d):
+                return set()
+            stems = {os.path.splitext(f)[0] for f in os.listdir(d) if _is_image_file(f)}
+            if not stems:
+                return set()
+            stem_sets.append(stems)
 
         if not stem_sets:
             # Fall back to checking any existing image directories in dir_map
@@ -439,7 +443,7 @@ class ClipEntry:
         if not stem_sets:
             return set()
 
-        # Intersection: frame complete only if ALL available enabled image outputs exist
+        # Intersection: frame complete only if ALL enabled image outputs exist
         result = stem_sets[0]
         for s in stem_sets[1:]:
             result &= s
@@ -452,7 +456,7 @@ class ClipEntry:
             return None
         try:
             import json
-            with open(manifest_path, 'r') as f:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             logger.debug(f"Failed to read manifest at {manifest_path}: {e}")
@@ -541,11 +545,11 @@ class ClipEntry:
         input_dir = os.path.join(self.root_path, "Input")
         source_dir = os.path.join(self.root_path, "Source")
 
-        if os.path.isdir(frames_dir) and os.listdir(frames_dir):
+        if os.path.isdir(frames_dir) and any(_is_image_file(f) for f in os.listdir(frames_dir)):
             self.input_asset = ClipAsset(frames_dir, 'sequence')
             # Determine source_type: check clip.json for provenance
             self.source_type = self._resolve_source_type()
-        elif os.path.isdir(input_dir) and os.listdir(input_dir):
+        elif os.path.isdir(input_dir) and any(_is_image_file(f) for f in os.listdir(input_dir)):
             self.input_asset = ClipAsset(input_dir, 'sequence')
             self.source_type = self._resolve_source_type()
         elif os.path.isdir(source_dir):
@@ -574,7 +578,8 @@ class ClipEntry:
                 # Clip remains visible with error state — don't raise
                 return
             else:
-                candidates = glob_module.glob(os.path.join(self.root_path, "[Ii]nput.*"))
+                escaped_root = glob_module.escape(self.root_path)
+                candidates = glob_module.glob(os.path.join(escaped_root, "[Ii]nput.*"))
                 candidates = [c for c in candidates if _is_video_file(c)]
                 if candidates:
                     self.input_asset = ClipAsset(candidates[0], 'video')
@@ -593,25 +598,31 @@ class ClipEntry:
             self.name = display
 
         # Alpha hint asset
+        escaped_root = glob_module.escape(self.root_path)
         alpha_dir = os.path.join(self.root_path, "AlphaHint")
-        if os.path.isdir(alpha_dir) and os.listdir(alpha_dir):
+        if os.path.isdir(alpha_dir) and any(_is_image_file(f) for f in os.listdir(alpha_dir)):
             self.alpha_asset = ClipAsset(alpha_dir, 'sequence')
         else:
             alpha_candidates = glob_module.glob(
-                os.path.join(self.root_path, "AlphaHint.*")
+                os.path.join(escaped_root, "AlphaHint.*")
             )
             alpha_candidates = [c for c in alpha_candidates if _is_video_file(c)]
             if alpha_candidates:
                 self.alpha_asset = ClipAsset(alpha_candidates[0], 'video')
 
-        # VideoMaMa mask hint — directory OR video file
-        mask_dir = os.path.join(self.root_path, "VideoMamaMaskHint")
-        if os.path.isdir(mask_dir) and os.listdir(mask_dir):
+        # Segmented mask hint — SamMaskHint primary (legacy VideoMamaMaskHint read-only fallback)
+        mask_dir = os.path.join(self.root_path, "SamMaskHint")
+        legacy_mask_dir = os.path.join(self.root_path, "VideoMamaMaskHint")
+        if os.path.isdir(mask_dir) and any(_is_image_file(f) for f in os.listdir(mask_dir)):
             self.mask_asset = ClipAsset(mask_dir, 'sequence')
+        elif os.path.isdir(legacy_mask_dir) and any(_is_image_file(f) for f in os.listdir(legacy_mask_dir)):
+            self.mask_asset = ClipAsset(legacy_mask_dir, 'sequence')
         else:
-            # Check for mask video file (VideoMamaMaskHint.mp4 etc.)
+            # Check for mask video file (SamMaskHint.mp4 or legacy fallback)
             mask_candidates = glob_module.glob(
-                os.path.join(self.root_path, "VideoMamaMaskHint.*")
+                os.path.join(escaped_root, "SamMaskHint.*")
+            ) + glob_module.glob(
+                os.path.join(escaped_root, "VideoMamaMaskHint.*")
             )
             mask_candidates = [c for c in mask_candidates if _is_video_file(c)]
             if mask_candidates:

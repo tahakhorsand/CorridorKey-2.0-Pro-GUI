@@ -169,7 +169,12 @@ class ChromaKeyMixin:
         if frame_bgr is None:
             logger.warning(f"Chroma key preview: imread failed for {input_path}")
             return
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        if frame_bgr.ndim == 2:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2RGB)
+        elif frame_bgr.shape[2] == 4:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGRA2RGB)
+        else:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         # EXR comes as float32 in 0-1 range; convert to uint8 for display
         if frame_rgb.dtype != np.uint8:
             frame_rgb = (np.clip(frame_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)

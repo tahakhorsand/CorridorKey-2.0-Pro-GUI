@@ -22,6 +22,13 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from .hair_matting import (
+    HairMattingConfig,
+    build_hair_roi_mask,
+    compute_mask_bbox,
+    refine_hair_boundary_tracked,
+    refine_hair_matte as _refine_hair_matte_v2,
+)
 from .sam3_core import SAM3Model, unpack_masks
 
 logger = logging.getLogger(__name__)
@@ -29,7 +36,6 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_SAM31_INT8_PATH = _PROJECT_ROOT / "weights" / "sam3" / "sam3.1-INT8-ConvRot.safetensors"
 _DEFAULT_SAM31_TRACKER_HEAD_PATH = _PROJECT_ROOT / "weights" / "sam3" / "sam3.1-tracker-head.safetensors"
-_COMFY_SAM31_FP16_FALLBACK = Path(r"E:\ComfyUI\ComfyUI\models\checkpoints\sam3.1_multiplex_fp16.safetensors")
 
 
 class SAM3NotInstalledError(RuntimeError):
@@ -44,7 +50,9 @@ class PromptFrame:
     negative_points: list[tuple[int, int]] = field(default_factory=list)
     box: Optional[tuple[int, int, int, int]] = None
     hair_points: list[tuple[int, int]] = field(default_factory=list)
+    hair_strokes: list[tuple[list[tuple[float, float]], float]] = field(default_factory=list)
     negative_strokes: list[tuple[list[tuple[int, int]], float]] = field(default_factory=list)
+    object_id: int = 1
 
 
 def _build_hadamard_matrices() -> tuple[torch.Tensor, torch.Tensor]:
@@ -159,13 +167,19 @@ def _load_sam31_state_dict(
             sd[f"detector.backbone.language_backbone.resizer.{s}"] = raw_hf.pop(f"text_projection.{s}")
 
     # Load tracker head weights
-    head_source = tracker_head_path if tracker_head_path.is_file() else _COMFY_SAM31_FP16_FALLBACK
-    if head_source.is_file():
+    import os
+    env_head = os.environ.get("SAM3_TRACKER_HEAD_PATH")
+    head_source = tracker_head_path if tracker_head_path.is_file() else (Path(env_head) if env_head else None)
+    if head_source is not None and head_source.is_file():
         with safe_open(str(head_source), framework="pt", device="cpu") as f_trk:
             for k in f_trk.keys():
                 if k.startswith("tracker.") or "propagation_convs" in k or "interactive_convs" in k:
                     t = f_trk.get_tensor(k)
                     sd[k] = t.to(dtype) if t.is_floating_point() else t
+    else:
+        raise SAM3NotInstalledError(
+            f"SAM 3.1 tracker head not found at {tracker_head_path}"
+        )
 
     # Standardize tracker keys for SAM31Tracker
     for k in list(sd.keys()):
@@ -198,68 +212,53 @@ def _load_sam31_state_dict(
 def refine_hair_matte(
     frame_rgb: np.ndarray,
     base_mask: np.ndarray,
-    hair_points: list[tuple[int, int]],
+    hair_points: Optional[list[tuple[int, int]]] = None,
     roi_radius: int = 40,
+    *,
+    hair_strokes: Optional[list[tuple[list[tuple[float, float]], float]]] = None,
+    negative_points: Optional[list[tuple[int, int]]] = None,
+    negative_strokes: Optional[list[tuple[list[tuple[int, int]], float]]] = None,
+    roi_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Color-guided soft detail refinement for hair, fur, and fuzzy edges.
+    """Color-line + two-pass RGB guided-filter refinement for hair, fur, and wispy edges.
 
-    Uses RGB frame guidance on top of the clean base mask to preserve fine hair strands,
-    flyaways, and semi-transparent edges without green spill or mask disruption.
+    Accepts a uint8 `[0..255]` or float `[0..1]` probability map (`base_mask`) and
+    carves trapped background pockets while recovering sub-pixel fine strands.
     """
+    if base_mask is None or (not hair_points and not hair_strokes and roi_mask is None):
+        return base_mask
+
     h, w = frame_rgb.shape[:2]
-    if not hair_points or base_mask is None:
-        return base_mask
-
-    roi = np.zeros((h, w), dtype=np.uint8)
-    for x, y in hair_points:
-        ix, iy = int(round(x)), int(round(y))
-        if 0 <= ix < w and 0 <= iy < h:
-            cv2.circle(roi, (ix, iy), roi_radius, 255, -1)
-
-    if not np.any(roi):
-        return base_mask
-
-    # Sample background color in ROI outside base mask
-    bg_mask = (roi > 0) & (base_mask == 0)
-    if np.count_nonzero(bg_mask) > 50:
-        bg_mean = np.mean(frame_rgb[bg_mask], axis=0)
+    if base_mask.dtype == np.uint8:
+        base_prob = base_mask.astype(np.float32) * (1.0 / 255.0)
     else:
-        bg_mean = np.mean(frame_rgb[:20, :20], axis=(0, 1))
+        base_prob = np.clip(base_mask.astype(np.float32), 0.0, 1.0)
+        if float(base_prob.max()) > 1.5:
+            base_prob = base_prob * (1.0 / 255.0)
 
-    # Detect green or blue screen background
-    r_bg, g_bg, b_bg = float(bg_mean[0]), float(bg_mean[1]), float(bg_mean[2])
-    is_green = (g_bg > r_bg + 5.0) and (g_bg > b_bg + 5.0)
-    is_blue = (b_bg > r_bg + 5.0) and (b_bg > g_bg + 5.0)
-
-    r = frame_rgb[:, :, 0].astype(np.float32)
-    g = frame_rgb[:, :, 1].astype(np.float32)
-    b = frame_rgb[:, :, 2].astype(np.float32)
-
-    if is_green:
-        excess_bg = max(1.0, g_bg - max(r_bg, b_bg))
-        excess_px = g - np.maximum(r, b)
-        hair_alpha = np.clip(1.0 - (excess_px / excess_bg), 0.0, 1.0)
-    elif is_blue:
-        excess_bg = max(1.0, b_bg - max(r_bg, g_bg))
-        excess_px = b - np.maximum(r, g)
-        hair_alpha = np.clip(1.0 - (excess_px / excess_bg), 0.0, 1.0)
+    if roi_mask is None:
+        eff_roi = build_hair_roi_mask(
+            h,
+            w,
+            hair_points=hair_points,
+            hair_strokes=hair_strokes,
+            default_point_radius=max(12.0, float(roi_radius) * 0.6),
+        )
     else:
-        diff_bg = np.linalg.norm(frame_rgb.astype(np.float32) - bg_mean, axis=2)
-        fg_mask = (roi > 0) & (base_mask > 200)
-        fg_mean = np.mean(frame_rgb[fg_mask], axis=0) if np.count_nonzero(fg_mask) > 50 else np.array([40.0, 40.0, 40.0])
-        diff_fg = np.linalg.norm(frame_rgb.astype(np.float32) - fg_mean, axis=2)
-        hair_alpha = np.clip(diff_bg / (diff_bg + diff_fg + 1e-4), 0.0, 1.0)
+        eff_roi = roi_mask
 
-    # Core erosion preserves the solid subject inside the hair ROI
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    m_eroded = cv2.erode(base_mask, kernel).astype(np.float32) / 255.0
-
-    refined_roi = np.maximum(m_eroded, hair_alpha)
-    roi_soft = cv2.GaussianBlur(roi.astype(np.float32) / 255.0, (15, 15), 0)
-
-    base_f = base_mask.astype(np.float32) / 255.0
-    final_f = np.clip((1.0 - roi_soft) * base_f + roi_soft * refined_roi, 0.0, 1.0)
-    return (final_f * 255.0).astype(np.uint8)
+    refined_f = _refine_hair_matte_v2(
+        frame_rgb=frame_rgb,
+        sam_prob=base_prob,
+        hair_points=hair_points,
+        hair_strokes=hair_strokes,
+        negative_points=negative_points,
+        negative_strokes=negative_strokes,
+        roi_mask=eff_roi,
+    )
+    if base_mask.dtype == np.uint8:
+        return np.clip(np.round(refined_f * 255.0), 0, 255).astype(np.uint8)
+    return refined_f
 
 
 def clean_binary_mask(
@@ -436,7 +435,19 @@ class SAM3Tracker:
         dt = self.dtype
 
         frame_t = torch.from_numpy(img_f).permute(2, 0, 1).unsqueeze(0)
-        frame_1008 = F.interpolate(frame_t, size=(1008, 1008), mode="bilinear", align_corners=False).to(device=dev, dtype=dt)
+        frame_1008 = (
+            F.interpolate(
+                frame_t,
+                size=(1008, 1008),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+            .clamp(0.0, 1.0)
+            .mul_(2.0)
+            .sub_(1.0)
+            .to(device=dev, dtype=dt)
+        )
 
         point_inputs = None
         if prompt.positive_points or prompt.negative_points:
@@ -462,21 +473,129 @@ class SAM3Tracker:
             )
 
         with torch.inference_mode():
-            mask_logit = self._model.forward_segment(
-                frame_1008,
+            backbone_feat, high_res = self._model.encode_interactive_features(frame_1008)
+            mask_logit = self._model.forward_segment_from_features(
+                backbone_feat,
+                high_res,
                 point_inputs=point_inputs,
                 box_inputs=box_inputs,
             )
             for _ in range(max(0, refine_iterations - 1)):
-                mask_logit = self._model.forward_segment(
-                    frame_1008,
+                mask_logit = self._model.forward_segment_from_features(
+                    backbone_feat,
+                    high_res,
                     point_inputs=point_inputs,
                     box_inputs=box_inputs,
                     mask_inputs=mask_logit,
                 )
             mask_full = F.interpolate(mask_logit.float(), size=(h, w), mode="bilinear", align_corners=False)
-            prob = torch.sigmoid(mask_full[0, 0]).cpu().numpy()
-            binary = (prob > 0.5).astype(np.uint8) * 255
+            prob_full = torch.sigmoid(mask_full[0, 0]).cpu().numpy().astype(np.float32)
+
+            hair_pts = getattr(prompt, "hair_points", None) or []
+            hair_strokes = getattr(prompt, "hair_strokes", None) or []
+            hair_roi = None
+            if hair_pts or hair_strokes:
+                hair_roi = build_hair_roi_mask(
+                    h,
+                    w,
+                    hair_points=hair_pts,
+                    hair_strokes=hair_strokes,
+                )
+                roi_bbox = compute_mask_bbox(
+                    hair_roi,
+                    threshold=0.05,
+                    pad=max(96, int(round(0.14 * max(h, w)))),
+                )
+                if roi_bbox is not None:
+                    cx0, cy0, cx1, cy1 = roi_bbox
+                    min_side = min(h, w, 256)
+                    if (cx1 - cx0) < min_side:
+                        need = min_side - (cx1 - cx0)
+                        cx0 = max(0, cx0 - need // 2)
+                        cx1 = min(w, cx0 + min_side)
+                        cx0 = max(0, cx1 - min_side)
+                    if (cy1 - cy0) < min_side:
+                        need = min_side - (cy1 - cy0)
+                        cy0 = max(0, cy0 - need // 2)
+                        cy1 = min(h, cy0 + min_side)
+                        cy0 = max(0, cy1 - min_side)
+                    cw, ch = cx1 - cx0, cy1 - cy0
+                    # Run a high-resolution zoomed SAM 3.1 pass when the hair crop is significantly smaller than full frame
+                    if cw >= 64 and ch >= 64 and (cw * ch) < (0.62 * w * h):
+                        try:
+                            crop_coords = []
+                            crop_labels = []
+                            for px, py in prompt.positive_points:
+                                if cx0 <= px < cx1 and cy0 <= py < cy1:
+                                    crop_coords.append([(px - cx0) / cw * 1008.0, (py - cy0) / ch * 1008.0])
+                                    crop_labels.append(1)
+                            for nx, ny in prompt.negative_points:
+                                if cx0 <= nx < cx1 and cy0 <= ny < cy1:
+                                    crop_coords.append([(nx - cx0) / cw * 1008.0, (ny - cy0) / ch * 1008.0])
+                                    crop_labels.append(0)
+
+                            prob_crop = prob_full[cy0:cy1, cx0:cx1]
+                            roi_crop = hair_roi[cy0:cy1, cx0:cx1]
+                            if crop_labels.count(1) == 0:
+                                fg_ys, fg_xs = np.where((prob_crop > 0.85) & (roi_crop < 0.2))
+                                if fg_ys.size == 0:
+                                    fg_ys, fg_xs = np.where(prob_crop > 0.80)
+                                if fg_ys.size > 0:
+                                    idxs = np.linspace(0, fg_ys.size - 1, min(3, fg_ys.size), dtype=int)
+                                    for idx in idxs:
+                                        crop_coords.append([float(fg_xs[idx]) / cw * 1008.0, float(fg_ys[idx]) / ch * 1008.0])
+                                        crop_labels.append(1)
+                            if crop_labels.count(0) == 0:
+                                bg_ys, bg_xs = np.where((prob_crop < 0.06) & (roi_crop < 0.2))
+                                if bg_ys.size > 0:
+                                    idxs = np.linspace(0, bg_ys.size - 1, min(2, bg_ys.size), dtype=int)
+                                    for idx in idxs:
+                                        crop_coords.append([float(bg_xs[idx]) / cw * 1008.0, float(bg_ys[idx]) / ch * 1008.0])
+                                        crop_labels.append(0)
+
+                            if crop_labels.count(1) >= 1 and crop_coords:
+                                crop_1008 = (
+                                    F.interpolate(
+                                        frame_t[:, :, cy0:cy1, cx0:cx1],
+                                        size=(1008, 1008),
+                                        mode="bicubic",
+                                        align_corners=False,
+                                        antialias=True,
+                                    )
+                                    .clamp(0.0, 1.0)
+                                    .mul_(2.0)
+                                    .sub_(1.0)
+                                    .to(device=dev, dtype=dt)
+                                )
+                                z_pts = {
+                                    "point_coords": torch.tensor([crop_coords], dtype=dt, device=dev),
+                                    "point_labels": torch.tensor([crop_labels], dtype=torch.int32, device=dev),
+                                }
+                                z_mask_in = F.interpolate(
+                                    mask_full[:, :, cy0:cy1, cx0:cx1],
+                                    size=(1008, 1008),
+                                    mode="bilinear",
+                                    align_corners=False,
+                                ).to(device=dev, dtype=dt)
+                                z_bf, z_hr = self._model.encode_interactive_features(crop_1008)
+                                z_logit = self._model.forward_segment_from_features(
+                                    z_bf,
+                                    z_hr,
+                                    point_inputs=z_pts,
+                                    mask_inputs=z_mask_in,
+                                )
+                                z_full = F.interpolate(z_logit.float(), size=(ch, cw), mode="bilinear", align_corners=False)
+                                prob_zoom = torch.sigmoid(z_full[0, 0]).cpu().numpy().astype(np.float32)
+                                z_blend = cv2.GaussianBlur(roi_crop, (0, 0), sigmaX=6.0, sigmaY=6.0)
+                                z_blend = np.clip(np.maximum(roi_crop, z_blend * 0.8), 0.0, 1.0)
+                                prob_full[cy0:cy1, cx0:cx1] = (
+                                    z_blend * (0.62 * prob_zoom + 0.38 * prob_crop)
+                                    + (1.0 - z_blend) * prob_crop
+                                )
+                        except Exception as exc:
+                            logger.debug("Zoomed SAM 3.1 hair crop pass skipped (%s)", exc)
+
+            binary = (prob_full > 0.5).astype(np.uint8) * 255
             cleaned = clean_binary_mask(
                 binary,
                 negative_points=prompt.negative_points,
@@ -488,10 +607,25 @@ class SAM3Tracker:
                 negative_points=prompt.negative_points,
             )
 
-            if getattr(prompt, "hair_points", None):
-                refined = refine_hair_matte(frame_rgb, cleaned, prompt.hair_points)
+            if hair_roi is not None and float(hair_roi.max()) > 0.05:
+                # Preserve un-thresholded continuous SAM probability inside hair ROI
+                # so hole filling / binary morphology never solidifies wispy background gaps.
+                cleaned_f = cleaned.astype(np.float32) * (1.0 / 255.0)
+                roi_soft = cv2.GaussianBlur(hair_roi, (0, 0), sigmaX=5.0, sigmaY=5.0)
+                roi_soft = np.clip(np.maximum(hair_roi, roi_soft), 0.0, 1.0)
+                base_prob = np.clip(roi_soft * prob_full + (1.0 - roi_soft) * cleaned_f, 0.0, 1.0)
+                refined_f = _refine_hair_matte_v2(
+                    frame_rgb=frame_rgb,
+                    sam_prob=base_prob,
+                    hair_points=hair_pts,
+                    hair_strokes=hair_strokes,
+                    negative_points=prompt.negative_points,
+                    negative_strokes=getattr(prompt, "negative_strokes", None),
+                    roi_mask=hair_roi,
+                )
+                refined_u8 = np.clip(np.round(refined_f * 255.0), 0, 255).astype(np.uint8)
                 return apply_negative_carveout(
-                    refined,
+                    refined_u8,
                     negative_strokes=getattr(prompt, "negative_strokes", None),
                     negative_points=prompt.negative_points,
                 )
@@ -531,9 +665,13 @@ class SAM3Tracker:
         prompt_frames: Optional[list[PromptFrame]] = None,
         **kwargs,
     ) -> list[np.ndarray]:
+        """Track sparse prompts across all video frames using SAM 3.1 memory propagation.
+
+        Supports multi-subject prompts grouped by `PromptFrame.object_id`,
+        tracking each subject and merging per-frame masks via `np.maximum`.
+        """
         if prompts is None:
             prompts = prompt_frames or []
-        """Track sparse prompts across all video frames using SAM 3.1 memory propagation."""
         self.prepare(on_progress=on_progress, on_status=on_status)
         assert self._model is not None
 
@@ -541,9 +679,14 @@ class SAM3Tracker:
         if num_frames == 0:
             return []
 
-        prompt_map = {p.frame_index: p for p in prompts if 0 <= p.frame_index < num_frames}
-        if not prompt_map:
+        valid_prompts = [p for p in prompts if 0 <= p.frame_index < num_frames]
+        if not valid_prompts:
             raise ValueError("No valid prompt frames in range.")
+
+        by_object: dict[int, list[PromptFrame]] = {}
+        for p in valid_prompts:
+            oid = max(1, int(getattr(p, "object_id", 1)))
+            by_object.setdefault(oid, []).append(p)
 
         h, w = frames[0].shape[:2]
         dev = torch.device(self.device)
@@ -554,138 +697,54 @@ class SAM3Tracker:
             if check_cancel:
                 check_cancel()
 
-            # Single-frame fast path
-            if num_frames == 1:
-                first_prompt = next(iter(prompt_map.values()))
-                mask = self._segment_single_frame_sam31(frames[0], first_prompt)
-                if on_progress:
-                    on_progress(1, 1)
-                return [mask]
+            obj_items = sorted(by_object.items(), key=lambda kv: kv[0])
+            if len(obj_items) == 1:
+                _, single_prompts = obj_items[0]
+                return self._track_video_single_object(
+                    frames,
+                    single_prompts,
+                    dev=dev,
+                    dt=dt,
+                    h=h,
+                    w=w,
+                    on_progress=on_progress,
+                    on_status=on_status,
+                    check_cancel=check_cancel,
+                )
 
-            first_key = min(prompt_map.keys())
-            if on_status:
-                on_status(f"SAM 3.1: Segmenting keyframe {first_key}...")
-
-            init_mask_u8 = self._segment_single_frame_sam31(frames[first_key], prompt_map[first_key])
-            init_mask_t = torch.from_numpy((init_mask_u8 > 127).astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device=dev, dtype=dt)
-
-            def _frames_to_cpu_tensor(frame_list: list[np.ndarray]) -> torch.Tensor:
-                arrs = []
-                for f in frame_list:
-                    if f.dtype == np.uint8:
-                        arrs.append(torch.from_numpy(f).permute(2, 0, 1).to(torch.float16).div_(255.0))
-                    else:
-                        arrs.append(torch.from_numpy(np.clip(f[..., :3], 0.0, 1.0)).permute(2, 0, 1).to(torch.float16))
-                return torch.stack(arrs, dim=0)
-
-            out_masks: list[Optional[np.ndarray]] = [None] * num_frames
-            out_masks[first_key] = init_mask_u8
-
-            class _PBarAdapter:
-                def __init__(self, start_count: int):
-                    self.count = start_count
-
-                def update(self, n: int = 1):
-                    if check_cancel:
-                        check_cancel()
-                    self.count += n
-                    if on_progress:
-                        on_progress(min(self.count, num_frames), num_frames)
-
-            pbar = _PBarAdapter(0)
-
-            # Propagate forward from first_key .. num_frames - 1
-            if first_key < num_frames - 1:
+            merged: list[np.ndarray] | None = None
+            total_objs = len(obj_items)
+            for idx, (oid, obj_prompts) in enumerate(obj_items):
+                if check_cancel:
+                    check_cancel()
                 if on_status:
-                    on_status("SAM 3.1: Propagating mask forward...")
-                fwd_frames = _frames_to_cpu_tensor(frames[first_key:])
-                with torch.inference_mode():
-                    res_fwd = self._model.forward_video(
-                        images=fwd_frames,
-                        initial_masks=init_mask_t,
-                        pbar=pbar,
-                        target_device=dev,
-                        target_dtype=dt,
-                    )
-                    packed_fwd = res_fwd.get("packed_masks")
-                    if packed_fwd is not None:
-                        for i in range(packed_fwd.shape[0]):
-                            unpacked = unpack_masks(packed_fwd[i : i + 1, 0]).unsqueeze(1).float()
-                            resized = F.interpolate(unpacked, size=(h, w), mode="bilinear", align_corners=False)[0, 0]
-                            prob_val = torch.sigmoid(resized).cpu().numpy()
-                            raw_u8 = ((prob_val > 0.5).astype(np.uint8)) * 255
-                            curr_frame_idx = first_key + i
-                            curr_prompt = prompt_map.get(curr_frame_idx, prompt_map[first_key])
-                            cleaned_mask = clean_binary_mask(
-                                raw_u8,
-                                negative_points=curr_prompt.negative_points if curr_prompt else None,
-                                negative_strokes=getattr(curr_prompt, "negative_strokes", None) if curr_prompt else None,
-                            )
-                            cleaned_mask = apply_negative_carveout(
-                                cleaned_mask,
-                                negative_strokes=getattr(curr_prompt, "negative_strokes", None) if curr_prompt else None,
-                                negative_points=curr_prompt.negative_points if curr_prompt else None,
-                            )
-                            frame_hair_pts = curr_prompt.hair_points if curr_prompt else []
-                            if frame_hair_pts:
-                                refined = refine_hair_matte(frames[curr_frame_idx], cleaned_mask, frame_hair_pts)
-                                out_masks[curr_frame_idx] = apply_negative_carveout(
-                                    refined,
-                                    negative_strokes=getattr(curr_prompt, "negative_strokes", None) if curr_prompt else None,
-                                    negative_points=curr_prompt.negative_points if curr_prompt else None,
-                                )
-                            else:
-                                out_masks[curr_frame_idx] = cleaned_mask
-                del fwd_frames, res_fwd
-
-            # Propagate backward from first_key .. 0 if first_key > 0
-            if first_key > 0:
-                if on_status:
-                    on_status("SAM 3.1: Propagating mask backward...")
-                bwd_frames = _frames_to_cpu_tensor(frames[first_key::-1])
-                with torch.inference_mode():
-                    res_bwd = self._model.forward_video(
-                        images=bwd_frames,
-                        initial_masks=init_mask_t,
-                        pbar=pbar,
-                        target_device=dev,
-                        target_dtype=dt,
-                    )
-                    packed_bwd = res_bwd.get("packed_masks")
-                    if packed_bwd is not None:
-                        for i in range(1, packed_bwd.shape[0]):
-                            unpacked = unpack_masks(packed_bwd[i : i + 1, 0]).unsqueeze(1).float()
-                            resized = F.interpolate(unpacked, size=(h, w), mode="bilinear", align_corners=False)[0, 0]
-                            prob_val = torch.sigmoid(resized).cpu().numpy()
-                            raw_u8 = ((prob_val > 0.5).astype(np.uint8)) * 255
-                            curr_frame_idx = first_key - i
-                            curr_prompt = prompt_map.get(curr_frame_idx, prompt_map[first_key])
-                            cleaned_mask = clean_binary_mask(
-                                raw_u8,
-                                negative_points=curr_prompt.negative_points if curr_prompt else None,
-                                negative_strokes=getattr(curr_prompt, "negative_strokes", None) if curr_prompt else None,
-                            )
-                            cleaned_mask = apply_negative_carveout(
-                                cleaned_mask,
-                                negative_strokes=getattr(curr_prompt, "negative_strokes", None) if curr_prompt else None,
-                                negative_points=curr_prompt.negative_points if curr_prompt else None,
-                            )
-                            frame_hair_pts = curr_prompt.hair_points if curr_prompt else []
-                            if frame_hair_pts:
-                                refined = refine_hair_matte(frames[curr_frame_idx], cleaned_mask, frame_hair_pts)
-                                out_masks[curr_frame_idx] = apply_negative_carveout(
-                                    refined,
-                                    negative_strokes=getattr(curr_prompt, "negative_strokes", None) if curr_prompt else None,
-                                    negative_points=curr_prompt.negative_points if curr_prompt else None,
-                                )
-                            else:
-                                out_masks[curr_frame_idx] = cleaned_mask
-                del bwd_frames, res_bwd
-
+                    on_status(f"SAM 3.1: Tracking subject #{oid} ({idx + 1}/{total_objs})...")
+                obj_prog = None
+                if on_progress is not None:
+                    def _obj_progress(cur: int, tot: int, _i: int = idx) -> None:
+                        base = _i * num_frames
+                        scaled = base + int(cur * num_frames / max(1, tot))
+                        on_progress(min(scaled, total_objs * num_frames), total_objs * num_frames)
+                    obj_prog = _obj_progress
+                obj_masks = self._track_video_single_object(
+                    frames,
+                    obj_prompts,
+                    dev=dev,
+                    dt=dt,
+                    h=h,
+                    w=w,
+                    on_progress=obj_prog,
+                    on_status=on_status,
+                    check_cancel=check_cancel,
+                )
+                if merged is None:
+                    merged = obj_masks
+                else:
+                    for t in range(num_frames):
+                        merged[t] = np.maximum(merged[t], obj_masks[t])
             if on_progress:
                 on_progress(num_frames, num_frames)
-
-            return [m if m is not None else np.zeros((h, w), dtype=np.uint8) for m in out_masks]
+            return merged if merged is not None else [np.zeros((h, w), dtype=np.uint8) for _ in range(num_frames)]
         finally:
             if self._model is not None:
                 try:
@@ -701,6 +760,216 @@ class SAM3Tracker:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _track_video_single_object(
+        self,
+        frames: list[np.ndarray],
+        prompts: list[PromptFrame],
+        *,
+        dev: torch.device,
+        dt: torch.dtype,
+        h: int,
+        w: int,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
+        check_cancel: Optional[Callable[[], None]] = None,
+    ) -> list[np.ndarray]:
+        """Track a single subject across all frames (assumes model is already on `dev`)."""
+        num_frames = len(frames)
+        prompt_map = {p.frame_index: p for p in prompts if 0 <= p.frame_index < num_frames}
+        if not prompt_map:
+            return [np.zeros((h, w), dtype=np.uint8) for _ in range(num_frames)]
+
+        # Single-frame fast path
+        if num_frames == 1:
+            first_prompt = next(iter(prompt_map.values()))
+            mask = self._segment_single_frame_sam31(frames[0], first_prompt)
+            if on_progress:
+                on_progress(1, 1)
+            return [mask]
+
+        sorted_keys = sorted(prompt_map.keys())
+
+        def _frames_to_cpu_tensor(frame_list: list[np.ndarray]) -> torch.Tensor:
+            arrs = []
+            for f in frame_list:
+                if f.dtype == np.uint8:
+                    t = torch.from_numpy(f).permute(2, 0, 1).to(torch.float16).div_(255.0)
+                else:
+                    t = torch.from_numpy(np.clip(f[..., :3], 0.0, 1.0)).permute(2, 0, 1).to(torch.float16)
+                arrs.append(t.mul_(2.0).sub_(1.0))
+            return torch.stack(arrs, dim=0)
+
+        norm_hair_rois: list[tuple[float, float, float, float]] = []
+
+        def _postprocess_frame_mask(
+            raw_u8: np.ndarray,
+            frame_idx: int,
+            prob_soft: Optional[np.ndarray] = None,
+        ) -> np.ndarray:
+            curr_prompt = prompt_map.get(frame_idx)
+            if curr_prompt is not None:
+                cleaned_mask = clean_binary_mask(
+                    raw_u8,
+                    negative_points=curr_prompt.negative_points,
+                    negative_strokes=getattr(curr_prompt, "negative_strokes", None),
+                )
+                cleaned_mask = apply_negative_carveout(
+                    cleaned_mask,
+                    negative_strokes=getattr(curr_prompt, "negative_strokes", None),
+                    negative_points=curr_prompt.negative_points,
+                )
+                frame_hair_pts = curr_prompt.hair_points or []
+                frame_hair_strokes = getattr(curr_prompt, "hair_strokes", None) or []
+                if frame_hair_pts or frame_hair_strokes:
+                    refined = refine_hair_matte(
+                        frames[frame_idx],
+                        prob_soft if prob_soft is not None else cleaned_mask,
+                        frame_hair_pts,
+                        hair_strokes=frame_hair_strokes,
+                        negative_points=curr_prompt.negative_points,
+                        negative_strokes=getattr(curr_prompt, "negative_strokes", None),
+                    )
+                    refined_u8 = (
+                        np.clip(np.round(refined * 255.0), 0, 255).astype(np.uint8)
+                        if refined.dtype != np.uint8
+                        else refined
+                    )
+                    return apply_negative_carveout(
+                        refined_u8,
+                        negative_strokes=getattr(curr_prompt, "negative_strokes", None),
+                        negative_points=curr_prompt.negative_points,
+                    )
+                return cleaned_mask
+
+            cleaned = clean_binary_mask(raw_u8)
+            if norm_hair_rois:
+                base_prob = prob_soft if prob_soft is not None else (cleaned.astype(np.float32) * (1.0 / 255.0))
+                # Preserve binary cleanup outside boundary while allowing hair refinement along tracked ROI
+                cleaned_f = cleaned.astype(np.float32) * (1.0 / 255.0)
+                merged_prob = np.where(np.abs(base_prob - 0.5) < 0.45, base_prob, cleaned_f)
+                refined_f = refine_hair_boundary_tracked(
+                    frames[frame_idx],
+                    merged_prob,
+                    norm_hair_rois=norm_hair_rois,
+                )
+                return np.clip(np.round(refined_f * 255.0), 0, 255).astype(np.uint8)
+            return cleaned
+
+        out_masks: list[Optional[np.ndarray]] = [None] * num_frames
+        keyframe_masks_u8: dict[int, np.ndarray] = {}
+        for kf in sorted_keys:
+            if check_cancel:
+                check_cancel()
+            if on_status:
+                on_status(f"SAM 3.1: Segmenting keyframe {kf}...")
+            kf_mask_u8 = self._segment_single_frame_sam31(frames[kf], prompt_map[kf])
+            keyframe_masks_u8[kf] = kf_mask_u8
+            out_masks[kf] = kf_mask_u8
+
+            # Record normalized hair ROI boxes relative to the segmented foreground bbox
+            # so tracked frames carry fine hair matting across head/camera motion.
+            p_kf = prompt_map[kf]
+            kf_hair_pts = getattr(p_kf, "hair_points", None) or []
+            kf_hair_strokes = getattr(p_kf, "hair_strokes", None) or []
+            if kf_hair_pts or kf_hair_strokes:
+                roi_kf = build_hair_roi_mask(h, w, hair_points=kf_hair_pts, hair_strokes=kf_hair_strokes)
+                r_bbox = compute_mask_bbox(roi_kf, threshold=0.1, pad=0)
+                obj_bbox = compute_mask_bbox(kf_mask_u8, threshold=127, pad=0)
+                if r_bbox is not None and obj_bbox is not None:
+                    bx0, by0, bx1, by1 = obj_bbox
+                    bw = max(1, bx1 - bx0)
+                    bh = max(1, by1 - by0)
+                    norm_hair_rois.append((
+                        (r_bbox[0] - bx0) / bw,
+                        (r_bbox[1] - by0) / bh,
+                        (r_bbox[2] - bx0) / bw,
+                        (r_bbox[3] - by0) / bh,
+                    ))
+
+        class _PBarAdapter:
+            def __init__(self, start_count: int):
+                self.count = start_count
+
+            def update(self, n: int = 1):
+                if check_cancel:
+                    check_cancel()
+                self.count += n
+                if on_progress:
+                    on_progress(min(self.count, num_frames), num_frames)
+
+        pbar = _PBarAdapter(0)
+
+        # Propagate forward within each keyframe segment [k_start .. k_end)
+        for seg_idx, k_start in enumerate(sorted_keys):
+            k_end = sorted_keys[seg_idx + 1] if (seg_idx + 1 < len(sorted_keys)) else num_frames
+            if k_start >= k_end - 1:
+                continue
+            if on_status:
+                on_status(f"SAM 3.1: Propagating mask forward ({k_start} -> {k_end - 1})...")
+            init_mask_t = (
+                torch.from_numpy((keyframe_masks_u8[k_start] > 127).astype(np.float32))
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(device=dev, dtype=dt)
+            )
+            fwd_frames = _frames_to_cpu_tensor(frames[k_start:k_end])
+            with torch.inference_mode():
+                res_fwd = self._model.forward_video(
+                    images=fwd_frames,
+                    initial_masks=init_mask_t,
+                    pbar=pbar,
+                    target_device=dev,
+                    target_dtype=dt,
+                )
+                packed_fwd = res_fwd.get("packed_masks")
+                if packed_fwd is not None:
+                    for i in range(1, packed_fwd.shape[0]):
+                        # unpack_masks returns boolean {0, 1}; do NOT apply sigmoid()
+                        unpacked = unpack_masks(packed_fwd[i : i + 1, 0]).unsqueeze(1).float()
+                        resized = F.interpolate(unpacked, size=(h, w), mode="bilinear", align_corners=False)[0, 0]
+                        prob_val = resized.cpu().numpy()
+                        raw_u8 = ((prob_val > 0.5).astype(np.uint8)) * 255
+                        curr_frame_idx = k_start + i
+                        out_masks[curr_frame_idx] = _postprocess_frame_mask(raw_u8, curr_frame_idx, prob_soft=prob_val)
+            del fwd_frames, res_fwd, init_mask_t
+
+        # Propagate backward from first_key .. 0 if first_key > 0
+        first_key = sorted_keys[0]
+        if first_key > 0:
+            if on_status:
+                on_status("SAM 3.1: Propagating mask backward...")
+            init_mask_t = (
+                torch.from_numpy((keyframe_masks_u8[first_key] > 127).astype(np.float32))
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(device=dev, dtype=dt)
+            )
+            bwd_frames = _frames_to_cpu_tensor(frames[first_key::-1])
+            with torch.inference_mode():
+                res_bwd = self._model.forward_video(
+                    images=bwd_frames,
+                    initial_masks=init_mask_t,
+                    pbar=pbar,
+                    target_device=dev,
+                    target_dtype=dt,
+                )
+                packed_bwd = res_bwd.get("packed_masks")
+                if packed_bwd is not None:
+                    for i in range(1, packed_bwd.shape[0]):
+                        # unpack_masks returns boolean {0, 1}; do NOT apply sigmoid()
+                        unpacked = unpack_masks(packed_bwd[i : i + 1, 0]).unsqueeze(1).float()
+                        resized = F.interpolate(unpacked, size=(h, w), mode="bilinear", align_corners=False)[0, 0]
+                        prob_val = resized.cpu().numpy()
+                        raw_u8 = ((prob_val > 0.5).astype(np.uint8)) * 255
+                        curr_frame_idx = first_key - i
+                        out_masks[curr_frame_idx] = _postprocess_frame_mask(raw_u8, curr_frame_idx, prob_soft=prob_val)
+            del bwd_frames, res_bwd, init_mask_t
+
+        if on_progress:
+            on_progress(num_frames, num_frames)
+
+        return [m if m is not None else np.zeros((h, w), dtype=np.uint8) for m in out_masks]
 
     def offload(self) -> None:
         if self._model is not None:

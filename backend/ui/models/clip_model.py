@@ -116,10 +116,22 @@ class ClipListModel(QAbstractListModel):
             return self._clips[row]
         return None
 
-    def update_clip_state(self, clip_name: str, new_state: ClipState) -> None:
-        """Update a clip's state by name and notify the view."""
+    def update_clip_state(
+        self,
+        clip_name: str,
+        new_state: ClipState,
+        *,
+        root_path: str | None = None,
+    ) -> None:
+        """Update a clip's state by root_path (preferred) or name and notify the view."""
+        norm_root = os.path.normcase(os.path.abspath(root_path)) if root_path else None
         for i, clip in enumerate(self._clips):
-            if clip.name == clip_name:
+            matched = (
+                os.path.normcase(os.path.abspath(clip.root_path)) == norm_root
+                if norm_root is not None
+                else clip.name == clip_name
+            )
+            if matched:
                 clip.state = new_state
                 idx = self.index(i)
                 self.dataChanged.emit(idx, idx, [Qt.DisplayRole, self.StateColorRole])

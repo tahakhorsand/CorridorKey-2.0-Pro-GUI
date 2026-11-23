@@ -519,17 +519,8 @@ class SAM3Model(nn.Module):
     def forward(self, images, **kwargs):
         return self.detector(images, **kwargs)
 
-    def forward_segment(self, images, point_inputs=None, box_inputs=None, mask_inputs=None):
-        """Interactive segmentation using SAM decoder with point/box/mask prompts.
-
-        Args:
-            images: [B, 3, 1008, 1008] preprocessed images
-            point_inputs: {"point_coords": [B, N, 2], "point_labels": [B, N]} in 1008x1008 pixel space
-            box_inputs: [B, 2, 2] box corners (top-left, bottom-right) in 1008x1008 pixel space
-            mask_inputs: [B, 1, H, W] coarse mask logits to refine
-        Returns:
-            [B, 1, image_size, image_size] high-res mask logits
-        """
+    def encode_interactive_features(self, images):
+        """Run ViT vision backbone once for interactive segmentation / zoomed passes."""
         bb = self.detector.backbone["vision_backbone"]
         if bb.multiplex:
             _, _, tracker_features, tracker_positions = bb(images, tracker_mode="interactive")
@@ -551,6 +542,17 @@ class SAM3Model(nn.Module):
             feat_flat = feat_flat + cast_to_input(no_mem, feat_flat)
             backbone_feat = feat_flat.view(B, H, W, C).permute(0, 3, 1, 2)
 
+        return backbone_feat, high_res
+
+    def forward_segment_from_features(
+        self,
+        backbone_feat,
+        high_res,
+        point_inputs=None,
+        box_inputs=None,
+        mask_inputs=None,
+    ):
+        """Decode interactive SAM masks from cached vision backbone features."""
         num_pts = 0 if point_inputs is None else point_inputs["point_labels"].size(1)
         _, high_res_masks, _, _ = self.tracker._forward_sam_heads(
             backbone_features=backbone_feat,
@@ -561,6 +563,26 @@ class SAM3Model(nn.Module):
             multimask_output=(0 < num_pts <= 3),
         )
         return high_res_masks
+
+    def forward_segment(self, images, point_inputs=None, box_inputs=None, mask_inputs=None):
+        """Interactive segmentation using SAM decoder with point/box/mask prompts.
+
+        Args:
+            images: [B, 3, 1008, 1008] preprocessed images
+            point_inputs: {"point_coords": [B, N, 2], "point_labels": [B, N]} in 1008x1008 pixel space
+            box_inputs: [B, 2, 2] box corners (top-left, bottom-right) in 1008x1008 pixel space
+            mask_inputs: [B, 1, H, W] coarse mask logits to refine
+        Returns:
+            [B, 1, image_size, image_size] high-res mask logits
+        """
+        backbone_feat, high_res = self.encode_interactive_features(images)
+        return self.forward_segment_from_features(
+            backbone_feat,
+            high_res,
+            point_inputs=point_inputs,
+            box_inputs=box_inputs,
+            mask_inputs=mask_inputs,
+        )
 
     def forward_video(self, images, initial_masks, pbar=None, text_prompts=None,
                        new_det_thresh=0.5, max_objects=0, detect_interval=1,

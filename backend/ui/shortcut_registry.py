@@ -62,6 +62,7 @@ SHORTCUT_DEFAULTS: list[ShortcutDef] = [
     ShortcutDef("eyedropper",         "Eyedropper (Pick Color)",      "Paint",      "C",            "_toggle_eyedropper",         app_shortcut=True),
     ShortcutDef("cycle_fg_color",     "Cycle Foreground Color",       "Paint",      "Shift+C",      "_cycle_fg_color",            app_shortcut=True),
     ShortcutDef("undo_annotation",    "Undo Paint Stroke",            "Paint",      "Ctrl+Z",       "_undo_annotation",           app_shortcut=True),
+    ShortcutDef("redo_annotation",    "Redo Paint Stroke",            "Paint",      "Ctrl+Y",       "_redo_annotation",           app_shortcut=True),
     ShortcutDef("clear_annotations",  "Clear Paint Strokes",          "Paint",      "Ctrl+Shift+X", "_confirm_clear_annotations", app_shortcut=True),
     ShortcutDef("chroma_key",         "Toggle Chroma Key",            "Paint",      "`",            "_toggle_chroma_key",         app_shortcut=True),
     # Viewer
@@ -78,6 +79,38 @@ SHORTCUT_DEFAULTS: list[ShortcutDef] = [
 
 # Category display order
 CATEGORY_ORDER = ["Global", "Timeline", "Playback", "Viewer", "Paint"]
+
+KEYMAP_PRESETS: dict[str, dict[str, str]] = {
+    "Default": {},
+    "Nuke": {
+        "fit_viewer": "F",
+        "toggle_ab_wipe": "W",
+        "annotation_brush": "R",
+        "poly_clear": "Ctrl+Shift+X",
+        "step_prev": "Left",
+        "step_next": "Right",
+        "view_input": "1",
+        "view_alpha": "2",
+        "view_comp": "3",
+        "play_pause": "L",
+    },
+    "After Effects": {
+        "set_in": "B",
+        "set_out": "N",
+        "play_pause": "Space",
+        "step_prev": "PgUp",
+        "step_next": "PgDown",
+        "fit_viewer": "Shift+/",
+        "annotation_brush": "Alt+B",
+    },
+    "DaVinci Resolve": {
+        "set_in": "I",
+        "set_out": "O",
+        "clear_in_out": "Alt+X",
+        "play_pause": "Space",
+        "toggle_ab_wipe": "Ctrl+W",
+    },
+}
 
 
 class ShortcutRegistry:
@@ -126,6 +159,16 @@ class ShortcutRegistry:
     def reset_all(self) -> None:
         """Reset all actions to defaults."""
         self._overrides.clear()
+
+    def apply_preset(self, preset_name: str) -> None:
+        """Apply a built-in NLE keymap preset ('Default', 'Nuke', 'After Effects', 'DaVinci Resolve')."""
+        preset = KEYMAP_PRESETS.get(preset_name)
+        if preset is None:
+            return
+        self._overrides.clear()
+        for action_id, key_str in preset.items():
+            if action_id in self._defs:
+                self._overrides[action_id] = key_str
 
     def is_default(self, action_id: str) -> bool:
         """True if the action uses its default key (no custom override)."""

@@ -8,7 +8,7 @@ import os
 
 
 
-from PySide6.QtCore import Slot, QTimer
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
 
 
 
@@ -23,6 +23,50 @@ from backend import ClipEntry, ClipState, PipelineRoute, classify_pipeline_route
 logger = logging.getLogger(__name__)
 
 
+class _ScreenColorSignals(QObject):
+    """Signal emitter for async screen color detection."""
+
+    detected = Signal(object, str)  # (clip, screen_color)
+
+
+class _ScreenColorTask(QRunnable):
+    """Read middle frame off the GUI thread and detect green/blue backdrop color."""
+
+    def __init__(self, clip: ClipEntry) -> None:
+        super().__init__()
+        self.clip = clip
+        self.signals = _ScreenColorSignals()
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        import numpy as np
+        detected = "green"
+        clip = self.clip
+        if clip.input_asset is not None:
+            try:
+                from corridorkey.color_utils import detect_screen_color
+                from backend.frame_io import read_image_frame, read_video_frame_at
+
+                frame = None
+                if clip.input_asset.asset_type == "sequence":
+                    files = clip.input_asset.get_frame_files()
+                    if files:
+                        mid_idx = len(files) // 2
+                        fpath = os.path.join(clip.input_asset.path, files[mid_idx])
+                        frame = read_image_frame(fpath)
+                elif clip.input_asset.asset_type == "video":
+                    mid_idx = max(0, clip.input_asset.frame_count // 2)
+                    frame = read_video_frame_at(clip.input_asset.path, mid_idx)
+
+                if frame is not None:
+                    if frame.dtype != np.uint8:
+                        frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+                    detected = detect_screen_color(frame) or "green"
+            except Exception as e:
+                logger.warning("Async screen color detection failed for '%s': %s", clip.name, e)
+        self.signals.detected.emit(clip, detected)
+
+
 
 
 
@@ -34,89 +78,50 @@ class ClipMixin:
 
     def _detect_and_apply_screen_color(self, clip: ClipEntry) -> None:
 
-        """Auto-detect screen color for a clip and update the UI accent.
+        """Auto-detect screen color for a clip off the GUI thread and update UI accent."""
 
-
-
-        Reads the middle frame once, caches the result, and triggers
-
-        the accent color swap if BG Color is set to Auto.
-
-        """
-
-        import numpy as np
-
-
-
-        cached = getattr(clip, '_screen_color_cache', None)
-
-        if not cached and clip.input_asset is not None:
-
-            try:
-
-                from corridorkey.color_utils import detect_screen_color
-
-                from backend.frame_io import read_image_frame, read_video_frame_at
-
-
-
-                frame = None
-
-                if clip.input_asset.asset_type == 'sequence':
-
-                    files = clip.input_asset.get_frame_files()
-
-                    if files:
-
-                        mid_idx = len(files) // 2
-
-                        fpath = os.path.join(clip.input_asset.path, files[mid_idx])
-
-                        frame = read_image_frame(fpath)
-
-                elif clip.input_asset.asset_type == 'video':
-
-                    mid_idx = max(0, clip.input_asset.frame_count // 2)
-
-                    frame = read_video_frame_at(clip.input_asset.path, mid_idx)
-
-
-
-                if frame is not None:
-
-                    if frame.dtype != np.uint8:
-
-                        frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
-
-                    cached = detect_screen_color(frame)
-
-                    clip._screen_color_cache = cached
-
-                    logger.info("Screen color for '%s': %s", clip.name, cached)
-
-            except Exception as e:
-
-                logger.warning("Screen color detection failed for '%s': %s", clip.name, e, exc_info=True)
-
-
-
-        if not cached:
-
-            cached = "green"
-
-
-
-        # In CorridorKey 2.0, green and blue are handled natively by the foundation model
-
-
-
-        # Only swap accent if BG Color dropdown is set to Auto
-
+        cached = getattr(clip, "_screen_color_cache", None)
         bg_idx = self._param_panel._bg_color.currentIndex()
 
-        effective = cached if bg_idx == 0 else ["auto", "green", "blue"][bg_idx]
+        if cached:
+            effective = cached if bg_idx == 0 else ["auto", "green", "blue"][bg_idx]
+            self._on_screen_color_changed(effective)
+            return
 
-        self._on_screen_color_changed(effective)
+        if bg_idx != 0:
+            self._on_screen_color_changed(["auto", "green", "blue"][bg_idx])
+
+        if clip.input_asset is None:
+            self._on_screen_color_changed("green")
+            return
+
+        task = _ScreenColorTask(clip)
+        refs = getattr(self, "_screen_color_signal_refs", None)
+        if not isinstance(refs, set):
+            refs = set()
+            self._screen_color_signal_refs = refs
+        refs.add(task.signals)
+
+        def _cleanup(_clip=clip, _sig=task.signals):
+            refs.discard(_sig)
+
+        task.signals.detected.connect(self._on_screen_color_detected)
+        task.signals.detected.connect(lambda _c, _s, _cb=_cleanup: _cb())
+        QThreadPool.globalInstance().start(task)
+
+    def _on_screen_color_detected(self, clip: ClipEntry, detected: str) -> None:
+        try:
+            import shiboken6
+            if not shiboken6.isValid(self):
+                return
+        except Exception:
+            pass
+        clip._screen_color_cache = detected or "green"
+        logger.info("Screen color for '%s': %s", clip.name, clip._screen_color_cache)
+        if getattr(self, "_current_clip", None) is clip:
+            bg_idx = self._param_panel._bg_color.currentIndex()
+            effective = clip._screen_color_cache if bg_idx == 0 else ["auto", "green", "blue"][bg_idx]
+            self._on_screen_color_changed(effective)
 
 
 
@@ -162,13 +167,24 @@ class ClipMixin:
 
         """Reload the selected clip while preserving its remembered input interpretation."""
 
+        self._last_sam3_preview = None
+
+        self._last_live_render = None
+
+        self._dual_viewer.set_live_render_modes(False)
+
         self._dual_viewer.set_clip(clip)
 
-
+        if hasattr(self, "_status_bar"):
+            self._status_bar.set_live_render_enabled(
+                clip.input_asset is not None and clip.state != ClipState.EXTRACTING
+            )
 
         if clip.input_asset is not None:
 
             input_is_linear = self._input_is_linear_for_clip(clip)
+
+            self._last_input_is_linear = input_is_linear
 
             self._param_panel.set_input_is_linear(input_is_linear)
 
@@ -182,9 +198,21 @@ class ClipMixin:
 
             )
 
+        else:
+
+            self._last_input_is_linear = None
+
 
 
         self._refresh_export_thumbnail(clip)
+
+        if hasattr(self, "_refresh_live_sam3_preview"):
+            iv = self._dual_viewer.input_viewer
+            if iv.annotation_model.has_annotations():
+                self._refresh_live_sam3_preview()
+
+        if self._param_panel.live_preview_enabled and clip.input_asset is not None:
+            self._reprocess_timer.start()
 
 
 
@@ -233,6 +261,10 @@ class ClipMixin:
         else:
 
             self._current_clip = None
+
+            if hasattr(self, "_clear_sam3_preview_cache"):
+
+                self._clear_sam3_preview_cache()
 
             self._dual_viewer.show_placeholder(_tr("No clip selected"))
 
@@ -310,11 +342,19 @@ class ClipMixin:
 
     def _on_clip_selected(self, clip: ClipEntry) -> None:
 
+        prev_root = self._current_clip.root_path if self._current_clip is not None else None
+
         if self._current_clip is not None and self._current_clip is not clip:
 
             self._remember_current_clip_input_color_space()
 
         self._current_clip = clip
+
+        if prev_root is not None and prev_root != clip.root_path:
+
+            if hasattr(self, "_clear_sam3_preview_cache"):
+
+                self._clear_sam3_preview_cache()
 
         # Track position for left-neighbor selection on delete
 
@@ -343,6 +383,29 @@ class ClipMixin:
         if hasattr(self, '_load_chroma_params_for_clip'):
 
             self._load_chroma_params_for_clip(clip)
+
+        if hasattr(self, '_load_inference_params_for_clip'):
+
+            self._load_inference_params_for_clip(clip)
+
+        if hasattr(self, '_sync_polygon_model_to_viewer'):
+
+            self._sync_polygon_model_to_viewer()
+
+        if hasattr(self, '_dual_viewer') and hasattr(self._dual_viewer, 'set_alpha_probe_array'):
+
+            self._dual_viewer.set_alpha_probe_array(None)
+
+        if hasattr(self, '_dual_viewer') and hasattr(self._dual_viewer, '_scrubber'):
+            src_vid = None
+            src_dir_p = os.path.join(clip.root_path, "Source")
+            if os.path.isdir(src_dir_p):
+                vids = sorted(fn for fn in os.listdir(src_dir_p) if os.path.splitext(fn)[1].lower() in (".mp4", ".mov", ".mxf", ".mkv", ".avi"))
+                if vids:
+                    src_vid = os.path.join(src_dir_p, vids[0])
+            elif clip.input_asset is not None and clip.input_asset.asset_type == "video":
+                src_vid = clip.input_asset.path
+            self._dual_viewer._scrubber.set_audio_source(src_vid)
 
 
 
@@ -460,6 +523,16 @@ class ClipMixin:
         previous_clips_dir = self._clips_dir
 
         self._clips_dir = dir_path
+
+        if (
+            previous_clips_dir is None
+            or os.path.normcase(os.path.abspath(previous_clips_dir))
+            != os.path.normcase(os.path.abspath(dir_path))
+        ):
+
+            if hasattr(self, "_clear_sam3_preview_cache"):
+
+                self._clear_sam3_preview_cache()
 
         # Reset status bar state on project load (no active job)
 

@@ -173,7 +173,7 @@ class StartupDiagnosticDialog(QDialog):
 
         header = QLabel(
             self.tr(
-                "EZ-CorridorKey detected issues with your environment that "
+                "CorridorKey 2.0 detected issues with your environment that "
                 "may prevent some features from working correctly."
             )
         )

@@ -123,26 +123,55 @@ def crop_model_chw_to_output(x: np.ndarray, model_native_hw, pad, output_hw):
     return resize_chw_lanczos(cropped, output_hw)
 
 
+def _imread_unicode(path: str, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray | None:
+    try:
+        path.encode("ascii")
+        return cv2.imread(path, flags)
+    except UnicodeEncodeError:
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+            if data.size == 0:
+                return None
+            return cv2.imdecode(data, flags)
+        except (OSError, ValueError):
+            return None
+
+
+def _imwrite_unicode(path: str, img: np.ndarray, params: list[int] | None = None) -> bool:
+    try:
+        path.encode("ascii")
+        return bool(cv2.imwrite(path, img, params or []))
+    except UnicodeEncodeError:
+        ext = os.path.splitext(path)[1]
+        ok, buf = cv2.imencode(ext, img, params or [])
+        if not ok:
+            return False
+        buf.tofile(path)
+        return True
+
+
 def read_image_rgb(path: str | os.PathLike):
     path = str(path)
     if path.lower().endswith(".exr"):
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        img = _imread_unicode(path, cv2.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(path)
         img = img.astype(np.float32, copy=False)
-        if img.ndim == 3 and img.shape[2] == 4:
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=-1)
+        elif img.ndim == 3 and img.shape[2] == 4:
             img = img[:, :, :3]
         if img.ndim == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    img = _imread_unicode(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(path)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
 
 def read_hint_image(path: str | os.PathLike) -> np.ndarray:
-    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    img = _imread_unicode(str(path), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(path)
     if img.dtype == np.uint8:
@@ -185,7 +214,8 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
                      native_resolution: bool, start_mode: str, seed: int,
                      model_scale: float, linear_brightness: float,
                      linear_contrast: float,
-                     linear_contrast_pivot: float) -> dict:
+                     linear_contrast_pivot: float,
+                     start_frame: int = 0) -> dict:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -209,18 +239,24 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
     else:
         raise ValueError("non-native inference is intentionally not exposed")
 
-    n_to_load = n_total if num_frames <= 0 else min(num_frames, n_total)
-    start_frame = 0
-    max_start = max(n_total - n_to_load, 0)
-    if max_start > 0 and num_frames > 0:
-        if start_mode == "middle":
-            start_frame = max_start // 2
-        elif start_mode == "random_middle":
-            lo = max_start // 4
-            hi = (3 * max_start) // 4
-            start_frame = int(np.random.default_rng(int(seed)).integers(lo, hi + 1))
-        elif start_mode != "begin":
-            raise ValueError(f"unknown start mode {start_mode!r}")
+    if int(start_frame) > 0:
+        resolved_start = min(int(start_frame), max(0, n_total - 1))
+        avail = max(0, n_total - resolved_start)
+        n_to_load = avail if num_frames <= 0 else min(num_frames, avail)
+        start_frame = resolved_start
+    else:
+        n_to_load = n_total if num_frames <= 0 else min(num_frames, n_total)
+        start_frame = 0
+        max_start = max(n_total - n_to_load, 0)
+        if max_start > 0 and num_frames > 0:
+            if start_mode == "middle":
+                start_frame = max_start // 2
+            elif start_mode == "random_middle":
+                lo = max_start // 4
+                hi = (3 * max_start) // 4
+                start_frame = int(np.random.default_rng(int(seed)).integers(lo, hi + 1))
+            elif start_mode != "begin":
+                raise ValueError(f"unknown start mode {start_mode!r}")
 
     meta = {
         "native_fps": native_fps,
@@ -257,7 +293,10 @@ def _read_frame_dir_views(path: str, *, exr_linear: bool):
 
 def probe_frame_dir_meta(frame_dir: str, *, num_frames: int,
                          shape_quantum: int, fps: float,
-                         exr_linear: bool, model_scale: float) -> dict:
+                         exr_linear: bool, model_scale: float,
+                         linear_brightness: float = 1.0,
+                         linear_contrast: float = 1.0,
+                         linear_contrast_pivot: float = 0.18) -> dict:
     paths = frame_paths(frame_dir)
     if not paths:
         raise RuntimeError(f"No frames found under {frame_dir}")
@@ -286,9 +325,9 @@ def probe_frame_dir_meta(frame_dir: str, *, num_frames: int,
         "pad": (pad_l, pad_r, pad_t, pad_b),
         "native_resolution": True,
         "exr_linear": bool(exr_linear),
-        "linear_brightness": 1.0,
-        "linear_contrast": 1.0,
-        "linear_contrast_pivot": 0.18,
+        "linear_brightness": float(linear_brightness),
+        "linear_contrast": float(linear_contrast),
+        "linear_contrast_pivot": float(linear_contrast_pivot),
     }
     print(f"  probed {len(paths)} frames from {frame_dir} @ {w_out}x{h_out} "
           f"(native {w_native}x{h_native}, fps {fps:.2f}, "
@@ -327,15 +366,26 @@ def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
         path, exr_linear=bool(meta.get("exr_linear", False)))
     display = resize_hwc_lanczos(display, (h_model, w_model))
     linear = resize_hwc_lanczos(linear, (h_model, w_model))
+    if has_linear_adjust(meta):
+        linear_adj = apply_linear_adjust(linear, meta)
+        foundation_np = cu.linear_to_vfm_sdr(linear_adj)
+        foundation_padded, _ = center_pad_to_shape(np.clip(foundation_np, 0.0, 1.0), h_out, w_out)
+        foundation_t = torch.from_numpy(
+            foundation_padded.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    else:
+        linear_adj = linear
+        foundation_t = None
     display, _ = center_pad_to_shape(np.clip(display, 0.0, 1.0), h_out, w_out)
     display_t = torch.from_numpy(
         display.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    if foundation_t is None:
+        foundation_t = display_t
     if not need_model:
-        return None, display_t, display_t
-    linear, _ = center_pad_to_shape(linear, h_out, w_out)
-    model = cu.linear_to_asinh(linear)
+        return None, foundation_t, display_t
+    linear_adj, _ = center_pad_to_shape(linear_adj, h_out, w_out)
+    model = cu.linear_to_asinh(linear_adj)
     model_t = torch.from_numpy(model.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
-    return model_t, display_t, display_t
+    return model_t, foundation_t, display_t
 
 
 class SequentialVideoWindowReader:
@@ -558,7 +608,7 @@ class SequentialHintFrameDirWindowReader:
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            frame = cv2.imread(self.paths[self.next_t], cv2.IMREAD_UNCHANGED)
+            frame = _imread_unicode(self.paths[self.next_t], cv2.IMREAD_UNCHANGED)
             self.cache[self.next_t] = preprocess_hint_frame(frame, self.meta)
             self.next_t += 1
 
@@ -634,11 +684,15 @@ class ThreadedVideoWriter:
             "-an"
         ]
         
-        if self.channels == 4:
+        if self.channels == 4 or self.cfg.codec == "prores_ks":
+            profile = "4" if (self.channels == 4 or str(self.cfg.preset) == "4") else "3"
+            pix_fmt = "yuva444p10le" if self.channels == 4 else (
+                self.cfg.pix_fmt if self.cfg.pix_fmt in ("yuv422p10le", "yuv444p10le", "yuva444p10le") else "yuv422p10le"
+            )
             cmd.extend([
                 "-c:v", "prores_ks",
-                "-profile:v", "4",
-                "-pix_fmt", "yuva444p10le"
+                "-profile:v", profile,
+                "-pix_fmt", pix_fmt,
             ])
         else:
             cmd.extend([
@@ -689,10 +743,21 @@ class ThreadedVideoWriter:
         self.q.put(arr)
 
     def release(self):
-        self.q.put(None)
-        self.thread.join()
+        while True:
+            if not self.thread.is_alive():
+                break
+            try:
+                self.q.put(None, timeout=0.25)
+                break
+            except queue.Full:
+                continue
+        if self.thread.is_alive():
+            self.thread.join(timeout=5.0)
         if self.proc is not None and self.proc.stdin is not None:
-            self.proc.stdin.close()
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
         rc = self.proc.wait() if self.proc is not None else 0
         if rc != 0 and self.err is None:
             self.err = RuntimeError(f"ffmpeg writer failed with exit code {rc}: {self.path}")
@@ -750,7 +815,7 @@ class ExrSequenceWriter:
                     frame = np.ascontiguousarray(arr[j])
                     if frame.shape[-1] == 1:
                         frame = frame[..., 0]
-                    if not cv2.imwrite(out_path, frame, self.imwrite_params):
+                    if not _imwrite_unicode(out_path, frame, self.imwrite_params):
                         raise RuntimeError(f"cv2.imwrite failed: {out_path}")
                 self.q.task_done()
         except Exception as exc:
@@ -773,8 +838,16 @@ class ExrSequenceWriter:
         self.write_many(frame[None])
 
     def release(self):
-        self.q.put(None)
-        self.thread.join()
+        while True:
+            if not self.thread.is_alive():
+                break
+            try:
+                self.q.put(None, timeout=0.25)
+                break
+            except queue.Full:
+                continue
+        if self.thread.is_alive():
+            self.thread.join(timeout=5.0)
         if self.err is not None:
             raise self.err
 

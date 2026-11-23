@@ -89,6 +89,14 @@ class ParallelInferenceMixin:
         # --- Worker threads (each bound to one engine) ---
         def worker(engine_idx: int) -> None:
             eng = engines[engine_idx]
+            if not hasattr(eng, "process_frame"):
+                from ..errors import CorridorKeyError
+                out_q.put((0, "", None, CorridorKeyError(
+                    "Legacy frame-by-frame engine is unavailable; CorridorKey 2.0 weights "
+                    "(corridorkey_v2.safetensors) are required."
+                )))
+                stop.set()
+                return
             while not stop.is_set():
                 try:
                     item = in_q.get(timeout=0.5)
@@ -102,7 +110,11 @@ class ParallelInferenceMixin:
                         img, mask,
                         input_is_linear=is_linear,
                         fg_is_straight=True,
-                        despill_strength=params.despill_strength,
+                        despill_strength=(
+                            params.despill_strength
+                            if getattr(params, "despill_enabled", True)
+                            else 0.0
+                        ),
                         auto_despeckle=params.auto_despeckle,
                         despeckle_size=params.despeckle_size,
                         despeckle_dilation=params.despeckle_dilation,

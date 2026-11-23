@@ -10,6 +10,7 @@ import sys
 import os
 import ctypes
 import logging
+import threading
 
 from PySide6.QtWidgets import QApplication, QMessageBox, QDialogButtonBox
 from PySide6.QtGui import QFontDatabase, QFont, QIcon
@@ -41,18 +42,6 @@ def _configure_runtime_backends() -> None:
     os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
     os.environ["QT_QUICK_BACKEND"] = "software"
 
-    # ── CUDA / cuDNN global settings ──
-    # These must be set once before any inference.  Previously they lived inside
-    # CorridorKeyEngine._load_model() which only runs lazily on first inference,
-    # so the first batch of frames ran without TF32 tensor-core acceleration.
-    try:
-        import torch
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.benchmark = False
-        logger.info("CUDA globals: TF32 precision='high', cuDNN benchmark=off")
-    except ImportError:
-        pass  # torch not installed – CPU-only environment
-
     if sys.platform != "win32":
         return
 
@@ -73,6 +62,14 @@ def _configure_runtime_backends() -> None:
         state.StateMask = 0  # 0 = disable throttling
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetProcessInformation.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        kernel32.SetProcessInformation.restype = ctypes.c_int
         handle = kernel32.GetCurrentProcess()
         ok = kernel32.SetProcessInformation(
             handle,
@@ -95,6 +92,9 @@ def _configure_runtime_backends() -> None:
     # The EcoQoS opt-out above only works on Win11; this covers Win10.
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        kernel32.SetPriorityClass.restype = ctypes.c_int
         ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
         if kernel32.SetPriorityClass(kernel32.GetCurrentProcess(),
                                      ABOVE_NORMAL_PRIORITY_CLASS):
@@ -115,10 +115,10 @@ def _migrate_legacy_settings() -> None:
     """One-time migration from old QSettings path to new one.
 
     Old: HKCU\\Software\\Corridor Digital\\CorridorKey
-    New: HKCU\\Software\\EZSCAPE\\EZ-CorridorKey
+    Current: configured QSettings org/app
     """
     from PySide6.QtCore import QSettings
-    new = QSettings()  # Uses current org/app (EZSCAPE / EZ-CorridorKey)
+    new = QSettings()  # Uses current org/app
     if new.value("_migrated_from_legacy", False, type=bool):
         return
     old = QSettings("Corridor Digital", "CorridorKey")
@@ -352,4 +352,40 @@ def create_app(argv: list[str] | None = None) -> QApplication:
     app._msgbox_filter = _MessageBoxFilter(app)
     app.installEventFilter(app._msgbox_filter)
 
+    # Guard against uncaught UI / thread exceptions terminating the event loop silently
+    _install_exception_hooks()
+
     return app
+
+
+_hooks_installed = False
+
+
+def _install_exception_hooks() -> None:
+    """Install safe global sys/threading exception hooks once per process."""
+    global _hooks_installed
+    if _hooks_installed:
+        return
+    _hooks_installed = True
+
+    orig_excepthook = sys.excepthook
+
+    def _safe_excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            orig_excepthook(exc_type, exc_value, exc_tb)
+            return
+        logger.critical("Unhandled UI exception", exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = _safe_excepthook
+
+    if hasattr(threading, "excepthook"):
+        def _safe_thread_excepthook(args):
+            if issubclass(args.exc_type, SystemExit):
+                return
+            logger.error(
+                "Unhandled thread exception in %s",
+                getattr(args.thread, "name", "unknown"),
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+
+        threading.excepthook = _safe_thread_excepthook

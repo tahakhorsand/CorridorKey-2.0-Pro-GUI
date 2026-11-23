@@ -13,6 +13,7 @@ import os
 import hashlib
 import logging
 
+import numpy as np
 from PySide6.QtCore import QObject, QRunnable, Signal, QThreadPool, QStandardPaths, Qt
 from PySide6.QtGui import QImage
 
@@ -86,10 +87,16 @@ class _ThumbTask(QRunnable):
     def run(self) -> None:
         try:
             qimg = self._generate()
-            self.signals.finished.emit(self._clip_name, self._kind, self._request_id, qimg)
+            try:
+                self.signals.finished.emit(self._clip_name, self._kind, self._request_id, qimg)
+            except RuntimeError:
+                pass
         except Exception as e:
             logger.debug(f"Thumbnail generation failed for {self._clip_name}: {e}")
-            self.signals.finished.emit(self._clip_name, self._kind, self._request_id, None)
+            try:
+                self.signals.finished.emit(self._clip_name, self._kind, self._request_id, None)
+            except RuntimeError:
+                pass
 
     def _generate(self) -> QImage | None:
         cache = _cache_path(
@@ -199,6 +206,13 @@ class _ThumbTask(QRunnable):
                         from backend.frame_io import read_video_frame_at
                         frame_rgb = read_video_frame_at(video_path, 0)
                         if frame_rgb is not None:
+                            if frame_rgb.ndim == 2:
+                                frame_rgb = np.stack([frame_rgb, frame_rgb, frame_rgb], axis=2)
+                            elif frame_rgb.ndim == 3 and frame_rgb.shape[2] == 4:
+                                frame_rgb = frame_rgb[:, :, :3]
+                            if frame_rgb.dtype != np.uint8:
+                                frame_rgb = (np.clip(frame_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+                            frame_rgb = np.ascontiguousarray(frame_rgb)
                             h, w, ch = frame_rgb.shape
                             bytes_per_line = ch * w
                             qimg = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
@@ -249,6 +263,7 @@ class ThumbnailGenerator(QObject):
         self._pool = QThreadPool.globalInstance()
         self._pending: set[tuple[str, str, str]] = set()
         self._latest_request: dict[tuple[str, str], str] = {}
+        self._active_signals: dict[tuple[str, str, str], _ThumbSignals] = {}
 
     def generate(
         self,
@@ -279,11 +294,14 @@ class ThumbnailGenerator(QObject):
             export_mode=export_mode,
             request_id=request_id,
         )
+        self._active_signals[pending_key] = task.signals
         task.signals.finished.connect(self._on_finished)
         self._pool.start(task)
 
     def _on_finished(self, clip_name: str, kind: str, request_id: str, qimage: object) -> None:
-        self._pending.discard((clip_name, kind, request_id))
+        key = (clip_name, kind, request_id)
+        self._pending.discard(key)
+        self._active_signals.pop(key, None)
         if self._latest_request.get((clip_name, kind)) != request_id:
             return
         if qimage is not None:

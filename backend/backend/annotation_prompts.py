@@ -13,14 +13,16 @@ import numpy as np
 
 @dataclass(frozen=True)
 class AnnotationPromptFrame:
-    """Prompt bundle extracted from one annotated frame."""
+    """Prompt bundle extracted from one annotated frame and subject object_id."""
 
     frame_index: int
     positive_points: list[tuple[float, float]]
     negative_points: list[tuple[float, float]]
     box: tuple[float, float, float, float] | None = None
     hair_points: list[tuple[float, float]] = field(default_factory=list)
+    hair_strokes: list[tuple[list[tuple[float, float]], float]] = field(default_factory=list)
     negative_strokes: list[tuple[list[tuple[float, float]], float]] = field(default_factory=list)
+    object_id: int = 1
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class AnnotationStroke:
     points: list[tuple[float, float]]
     brush_type: str = "fg"
     radius: float = 15.0
+    object_id: int = 1
 
 
 def load_annotation_mask_frames(
@@ -56,8 +59,13 @@ def load_annotation_mask_frames(
     prompt_frames: list[AnnotationMaskFrame] = []
 
     for frame_key, strokes_data in raw.items():
-        frame_index = int(frame_key)
+        try:
+            frame_index = int(frame_key)
+        except (ValueError, TypeError):
+            continue
         if allowed is not None and frame_index not in allowed:
+            continue
+        if not isinstance(strokes_data, list):
             continue
 
         strokes = [_coerce_stroke(stroke) for stroke in strokes_data]
@@ -94,77 +102,92 @@ def load_annotation_prompt_frames(
     prompt_frames: list[AnnotationPromptFrame] = []
 
     for frame_key, strokes in raw.items():
-        frame_index = int(frame_key)
+        try:
+            frame_index = int(frame_key)
+        except (ValueError, TypeError):
+            continue
         if allowed is not None and frame_index not in allowed:
             continue
-
-        positives: list[tuple[float, float]] = []
-        negatives: list[tuple[float, float]] = []
-        hair_points: list[tuple[float, float]] = []
-        negative_strokes: list[tuple[list[tuple[float, float]], float]] = []
-        box_prompt: tuple[float, float, float, float] | None = None
-        for stroke in strokes:
-            brush_type = stroke.get("brush_type", "fg")
-            radius = float(stroke.get("radius", 15.0))
-            pts = stroke.get("points", [])
-            if not pts:
-                continue
-            if brush_type == "bg":
-                negative_strokes.append(([(float(p[0]), float(p[1])) for p in pts], radius))
-                if len(pts) == 1:
-                    negatives.append((float(pts[0][0]), float(pts[0][1])))
-                else:
-                    bg_points = _sample_points(
-                        pts,
-                        _effective_cap(max_points_per_stroke, max_negative_points_per_stroke),
-                    )
-                    negatives.extend(bg_points)
-            elif brush_type == "box":
-                if len(pts) >= 2:
-                    xs = [p[0] for p in pts]
-                    ys = [p[1] for p in pts]
-                    box_prompt = (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
-            elif brush_type == "hair":
-                if len(pts) == 1:
-                    hair_points.append((float(pts[0][0]), float(pts[0][1])))
-                else:
-                    points = _sample_points(pts, max_points_per_stroke)
-                    hair_points.extend(points)
-            else:
-                if len(pts) == 1:
-                    positives.append((float(pts[0][0]), float(pts[0][1])))
-                else:
-                    points = _sample_points(pts, max_points_per_stroke)
-                    positives.extend(points)
-
-        if not positives and not box_prompt and hair_points:
-            # If the user only painted hair with no separate FG points or box,
-            # provide ONE single anchor point (the centroid) so SAM knows what object to segment
-            cx = float(np.mean([p[0] for p in hair_points]))
-            cy = float(np.mean([p[1] for p in hair_points]))
-            positives.append((cx, cy))
-
-        if not positives and not negatives and box_prompt is None and not hair_points:
+        if not isinstance(strokes, list):
             continue
 
-        prompt_frames.append(
-            AnnotationPromptFrame(
-                frame_index=frame_index,
-                positive_points=_cap_points(
-                    _dedupe_points(positives),
-                    _effective_cap(max_points_per_frame, max_positive_points_per_frame),
-                ),
-                negative_points=_cap_points(
-                    _dedupe_points(negatives),
-                    _effective_cap(max_points_per_frame, max_negative_points_per_frame),
-                ),
-                box=box_prompt,
-                hair_points=_dedupe_points(hair_points),
-                negative_strokes=negative_strokes,
-            )
-        )
+        by_object: dict[int, list[dict]] = {}
+        for stroke in strokes:
+            obj_id = max(1, int(stroke.get("object_id", 1)))
+            by_object.setdefault(obj_id, []).append(stroke)
 
-    prompt_frames.sort(key=lambda item: item.frame_index)
+        for obj_id, obj_strokes in sorted(by_object.items()):
+            positives: list[tuple[float, float]] = []
+            negatives: list[tuple[float, float]] = []
+            hair_points: list[tuple[float, float]] = []
+            hair_strokes: list[tuple[list[tuple[float, float]], float]] = []
+            negative_strokes: list[tuple[list[tuple[float, float]], float]] = []
+            box_prompt: tuple[float, float, float, float] | None = None
+            for stroke in obj_strokes:
+                brush_type = stroke.get("brush_type", "fg")
+                radius = float(stroke.get("radius", 15.0))
+                pts = stroke.get("points", [])
+                if not pts:
+                    continue
+                if brush_type == "bg":
+                    negative_strokes.append(([(float(p[0]), float(p[1])) for p in pts], radius))
+                    if len(pts) == 1:
+                        negatives.append((float(pts[0][0]), float(pts[0][1])))
+                    else:
+                        bg_points = _sample_points(
+                            pts,
+                            _effective_cap(max_points_per_stroke, max_negative_points_per_stroke),
+                        )
+                        negatives.extend(bg_points)
+                elif brush_type == "box":
+                    if len(pts) >= 2:
+                        xs = [p[0] for p in pts]
+                        ys = [p[1] for p in pts]
+                        box_prompt = (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
+                elif brush_type == "hair":
+                    hair_strokes.append(([(float(p[0]), float(p[1])) for p in pts], radius))
+                    if len(pts) == 1:
+                        hair_points.append((float(pts[0][0]), float(pts[0][1])))
+                    else:
+                        points = _sample_points(pts, max_points_per_stroke)
+                        hair_points.extend(points)
+                else:
+                    if len(pts) == 1:
+                        positives.append((float(pts[0][0]), float(pts[0][1])))
+                    else:
+                        points = _sample_points(pts, max_points_per_stroke)
+                        positives.extend(points)
+
+            if not positives and not box_prompt and hair_points:
+                # If the user only painted hair with no separate FG points or box,
+                # provide ONE single anchor point (the centroid) so SAM knows what object to segment
+                cx = float(np.mean([p[0] for p in hair_points]))
+                cy = float(np.mean([p[1] for p in hair_points]))
+                positives.append((cx, cy))
+
+            if not positives and not negatives and box_prompt is None and not hair_points:
+                continue
+
+            prompt_frames.append(
+                AnnotationPromptFrame(
+                    frame_index=frame_index,
+                    positive_points=_cap_points(
+                        _dedupe_points(positives),
+                        _effective_cap(max_points_per_frame, max_positive_points_per_frame),
+                    ),
+                    negative_points=_cap_points(
+                        _dedupe_points(negatives),
+                        _effective_cap(max_points_per_frame, max_negative_points_per_frame),
+                    ),
+                    box=box_prompt,
+                    hair_points=_dedupe_points(hair_points),
+                    hair_strokes=hair_strokes,
+                    negative_strokes=negative_strokes,
+                    object_id=obj_id,
+                )
+            )
+
+    prompt_frames.sort(key=lambda item: (item.frame_index, item.object_id))
     return prompt_frames
 
 
@@ -178,6 +201,15 @@ def rasterize_annotation_strokes(
     mask = np.zeros((height, width), dtype=np.uint8)
 
     for stroke in strokes:
+        if stroke.brush_type == "box":
+            if len(stroke.points) >= 2:
+                xs = [p[0] for p in stroke.points]
+                ys = [p[1] for p in stroke.points]
+                x1, y1 = int(round(min(xs))), int(round(min(ys)))
+                x2, y2 = int(round(max(xs))), int(round(max(ys)))
+                cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            continue
+
         color = 255 if stroke.brush_type in ("fg", "hair") else 0
         radius = max(1, int(round(stroke.radius)))
 
@@ -204,8 +236,13 @@ def _load_annotations_json(clip_root: str) -> dict[str, list[dict]] | None:
     path = os.path.join(clip_root, "annotations.json")
     if not os.path.isfile(path):
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        logger.warning("Failed to load annotations.json at %s: %s", path, exc)
+        return None
 
 
 def _coerce_stroke(raw: dict) -> AnnotationStroke:
@@ -218,6 +255,7 @@ def _coerce_stroke(raw: dict) -> AnnotationStroke:
         points=points,
         brush_type=str(raw.get("brush_type", "fg")),
         radius=float(raw.get("radius", 15.0)),
+        object_id=max(1, int(raw.get("object_id", 1))),
     )
 
 

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 
 import os
-
+import shutil
 import logging
 
 import tempfile
@@ -168,7 +168,11 @@ class GPUJobWorker(QThread):
 
         self._max_workers = max(1, max_workers)
 
-        self._concurrency_sem = threading.Semaphore(self._max_workers)
+        self._pool_cond = threading.Condition()
+
+        self._active_pool_jobs = 0
+
+        self._queue_state_lock = threading.Lock()
 
         # Wire engine pool size for frame-level parallelism
 
@@ -222,11 +226,11 @@ class GPUJobWorker(QThread):
 
         old = self._max_workers
 
-        self._max_workers = n
+        with self._pool_cond:
 
-        # Replace semaphore — safe because only the main loop acquires it
+            self._max_workers = n
 
-        self._concurrency_sem = threading.Semaphore(n)
+            self._pool_cond.notify_all()
 
         # Wire engine pool size for frame-level parallelism
 
@@ -240,21 +244,31 @@ class GPUJobWorker(QThread):
 
         """Wake the worker to check for new jobs."""
 
-        self._condition.wakeOne()
+        self._mutex.lock()
+
+        try:
+
+            self._condition.wakeOne()
+
+        finally:
+
+            self._mutex.unlock()
 
 
 
     def stop(self) -> None:
 
-        """Signal the worker to stop after current jobs."""
+        """Signal the worker to stop without blocking the caller (UI) thread."""
 
         self._running = False
 
         self._queue.cancel_all()
 
-        self._drain_pool()
+        with self._pool_cond:
 
-        self._condition.wakeOne()
+            self._pool_cond.notify_all()
+
+        self.wake()
 
 
 
@@ -336,9 +350,15 @@ class GPUJobWorker(QThread):
 
                 if not has_inflight and not self._queue.has_pending:
 
-                    if not self._queue_empty_emitted:
+                    with self._queue_state_lock:
 
-                        self._queue_empty_emitted = True
+                        should_emit = not self._queue_empty_emitted
+
+                        if should_emit:
+
+                            self._queue_empty_emitted = True
+
+                    if should_emit:
 
                         self.queue_empty.emit()
 
@@ -348,7 +368,7 @@ class GPUJobWorker(QThread):
 
                 self._mutex.lock()
 
-                if self._running and not self._queue.has_pending:
+                if self._running and (not self._queue.has_pending or self._queue.is_paused):
 
                     self._condition.wait(self._mutex, 500)
 
@@ -358,7 +378,9 @@ class GPUJobWorker(QThread):
 
 
 
-            self._queue_empty_emitted = False  # Reset — will fire again when all done
+            with self._queue_state_lock:
+
+                self._queue_empty_emitted = False  # Reset — will fire again when all done
 
             if job.job_type in _PARALLEL_JOB_TYPES and self._max_workers > 1 and not self._draining:
 
@@ -392,6 +414,10 @@ class GPUJobWorker(QThread):
 
             self._pool = None
 
+        if self._preview_dir and os.path.isdir(self._preview_dir):
+
+            shutil.rmtree(self._preview_dir, ignore_errors=True)
+
         logger.info("GPU worker stopped")
 
 
@@ -408,7 +434,13 @@ class GPUJobWorker(QThread):
 
         def _run_in_pool() -> None:
 
-            self._concurrency_sem.acquire()
+            with self._pool_cond:
+
+                while self._active_pool_jobs >= self._max_workers and self._running:
+
+                    self._pool_cond.wait(timeout=0.5)
+
+                self._active_pool_jobs += 1
 
             try:
 
@@ -416,7 +448,11 @@ class GPUJobWorker(QThread):
 
             finally:
 
-                self._concurrency_sem.release()
+                with self._pool_cond:
+
+                    self._active_pool_jobs = max(0, self._active_pool_jobs - 1)
+
+                    self._pool_cond.notify_all()
 
                 with self._inflight_lock:
 
@@ -424,7 +460,7 @@ class GPUJobWorker(QThread):
 
                 # Wake main loop to check for more work / queue_empty
 
-                self._condition.wakeOne()
+                self.wake()
 
 
 
@@ -544,43 +580,48 @@ class GPUJobWorker(QThread):
 
         except CorridorKeyError as e:
 
-            logger.error(f"Job failed [{job_id}]: {job.clip_name} — {e}")
-
-            try:
-
-                from backend.error_reporting import capture_stage_exception
-
-                capture_stage_exception("inference", e)
-
-            except Exception:
-
-                pass
-
-            self._queue.fail_job(job, str(e))
-
-            self.error.emit(job_id, job.clip_name, str(e))
-
-
+            if job.job_type in (JobType.PREVIEW_REPROCESS, JobType.SAM3_PREVIEW):
+                self._queue.mark_cancelled(job)
+                logger.warning("Preview job skipped [%s]: %s", job_id, e)
+                self.warning.emit(job_id, f"Preview skipped: {e}")
+            else:
+                logger.error(f"Job failed [{job_id}]: {job.clip_name} — {e}")
+                try:
+                    from backend.error_reporting import capture_stage_exception
+                    capture_stage_exception("inference", e)
+                except Exception:
+                    pass
+                self._queue.fail_job(job, str(e))
+                self.error.emit(job_id, job.clip_name, str(e))
 
         except Exception as e:
 
-            msg = f"Unexpected error: {e}"
+            is_oom = "out of memory" in str(e).lower() or type(e).__name__ == "OutOfMemoryError"
+            if is_oom:
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
-            try:
-
-                from backend.error_reporting import capture_stage_exception
-
-                capture_stage_exception("inference", e)
-
-            except Exception:
-
-                pass
-
-            self._queue.fail_job(job, msg)
-
-            self.error.emit(job_id, job.clip_name, msg)
-
-            logger.exception(msg)
+            if job.job_type in (JobType.PREVIEW_REPROCESS, JobType.SAM3_PREVIEW):
+                self._queue.mark_cancelled(job)
+                msg = f"Preview skipped ({'Out of VRAM' if is_oom else e})"
+                logger.warning("Preview error [%s]: %s", job_id, e)
+                self.warning.emit(job_id, msg)
+            else:
+                msg = f"Unexpected error: {e}"
+                try:
+                    from backend.error_reporting import capture_stage_exception
+                    capture_stage_exception("inference", e)
+                except Exception:
+                    pass
+                self._queue.fail_job(job, msg)
+                self.error.emit(job_id, job.clip_name, msg)
+                logger.exception(msg)
 
 
 
@@ -592,9 +633,15 @@ class GPUJobWorker(QThread):
 
         if not self._queue.has_pending and not has_inflight:
 
-            if not self._queue_empty_emitted:
+            with self._queue_state_lock:
 
-                self._queue_empty_emitted = True
+                should_emit = not self._queue_empty_emitted
+
+                if should_emit:
+
+                    self._queue_empty_emitted = True
+
+            if should_emit:
 
                 self.queue_empty.emit()
 
@@ -618,17 +665,20 @@ class GPUJobWorker(QThread):
 
 
 
+        frame_range = job.params.get("_frame_range")
+        range_offset = int(frame_range[0]) if frame_range is not None else 0
+
         def on_progress(clip_name: str, current: int, total: int, **kwargs) -> None:
 
             self.progress.emit(job.id, clip_name, current, total, kwargs.get("fps", 0.0))
 
 
 
-            # Live preview — update on every rendered frame!
+            # Live preview — update on every rendered frame using global timeline index!
 
             if current > 0:
 
-                self._save_preview(job.id, clip, current)
+                self._save_preview(job.id, clip, range_offset + current)
 
 
 
@@ -645,8 +695,6 @@ class GPUJobWorker(QThread):
 
 
         output_config = job.params.get("_output_config")
-
-        frame_range = job.params.get("_frame_range")
 
         self._service.run_inference(
 
@@ -667,44 +715,6 @@ class GPUJobWorker(QThread):
             output_config=output_config,
 
             frame_range=frame_range,
-
-        )
-
-
-
-    def _run_gvm(self, job: GPUJob) -> None:
-
-        """Run GVM auto alpha generation."""
-
-        clip = job.params.get("_clip_snapshot")
-
-        if clip is None:
-
-            raise CorridorKeyError(f"Job [{job.id}] for '{job.clip_name}' missing clip snapshot")
-
-
-
-        def on_progress(clip_name: str, current: int, total: int, **kwargs) -> None:
-
-            self.progress.emit(job.id, clip_name, current, total, kwargs.get("fps", 0.0))
-
-
-
-        def on_warning(message: str) -> None:
-
-            self.warning.emit(job.id, message)
-
-
-
-        self._service.run_gvm(
-
-            clip=clip,
-
-            job=job,
-
-            on_progress=on_progress,
-
-            on_warning=on_warning,
 
         )
 
@@ -896,59 +906,11 @@ class GPUJobWorker(QThread):
 
         if result is not None:
 
+            if "_live_seq" in job.params:
+
+                result["_live_seq"] = job.params["_live_seq"]
+
             self.reprocess_result.emit(job.id, result)
-
-
-
-    def _run_videomama(self, job: GPUJob) -> None:
-
-        """Run VideoMaMa guided alpha generation."""
-
-        clip = job.params.get("_clip_snapshot")
-
-        chunk_size = job.params.get("_chunk_size", 16)
-
-
-
-        if clip is None:
-
-            raise CorridorKeyError(f"Job [{job.id}] for '{job.clip_name}' missing clip snapshot")
-
-
-
-        def on_progress(clip_name: str, current: int, total: int, **kwargs) -> None:
-
-            self.progress.emit(job.id, clip_name, current, total, kwargs.get("fps", 0.0))
-
-
-
-        def on_warning(message: str) -> None:
-
-            self.warning.emit(job.id, message)
-
-
-
-        def on_status(message: str) -> None:
-
-            self.status_update.emit(job.id, message)
-
-
-
-        self._service.run_videomama(
-
-            clip=clip,
-
-            job=job,
-
-            on_progress=on_progress,
-
-            on_warning=on_warning,
-
-            on_status=on_status,
-
-            chunk_size=chunk_size,
-
-        )
 
 
 
@@ -1081,6 +1043,10 @@ class GPUJobWorker(QThread):
 
         if result is not None:
 
+            if "_live_seq" in job.params:
+
+                result["_live_seq"] = job.params["_live_seq"]
+
             self.reprocess_result.emit(job.id, result)
 
 
@@ -1099,7 +1065,7 @@ class GPUJobWorker(QThread):
 
         try:
 
-            comp_dir = os.path.join(clip.root_path, "Output", "Comp")
+            comp_dir = os.path.join(clip.output_dir, "Comp")
 
             if not os.path.isdir(comp_dir):
 

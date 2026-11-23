@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from backend.frame_io import imread_unicode
-from sam3_tracker import PromptFrame
+
+if TYPE_CHECKING:
+    from sam3_tracker import PromptFrame
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,7 @@ class SAM3LivePreviewWorker(QThread):
         stem_idx: int,
         service: Any,
         is_linear: bool = False,
+        clip_root: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -38,6 +41,7 @@ class SAM3LivePreviewWorker(QThread):
         self.stem_idx = stem_idx
         self.service = service
         self.is_linear = is_linear
+        self.clip_root = clip_root
 
     def run(self) -> None:
         try:
@@ -52,7 +56,12 @@ class SAM3LivePreviewWorker(QThread):
                 logger.warning("SAM3LivePreviewWorker: failed to read %s", self.input_path)
                 return
 
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if frame_bgr.ndim == 2:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2RGB)
+            elif frame_bgr.shape[2] == 4:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGRA2RGB)
+            else:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             if frame_rgb.dtype != np.uint8:
                 if self.is_linear:
                     frame_rgb = np.power(np.clip(frame_rgb, 0.0, 1.0), 1.0 / 2.2)

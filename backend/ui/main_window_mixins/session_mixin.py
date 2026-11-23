@@ -100,7 +100,9 @@ class SessionMixin:
 
         # Restore live preview toggle
         if "live_preview" in data:
-            self._param_panel._live_preview.setChecked(bool(data["live_preview"]))
+            enabled = bool(data["live_preview"])
+            self._param_panel.set_live_preview_checked(enabled)
+            self._status_bar.set_live_render_checked(enabled)
 
         if "clip_input_is_linear" in data:
             try:

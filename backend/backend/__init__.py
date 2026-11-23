@@ -1,8 +1,10 @@
-"""Backend service layer for ez-CorridorKey."""
+"""Backend service layer for CorridorKey 2.0 Pro."""
 
 import os
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
+APP_VERSION = "2.0.0"
 
 from .clip_state import (
     ClipAsset, ClipEntry, ClipState, InOutRange, PipelineRoute,

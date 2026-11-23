@@ -191,9 +191,12 @@ def chroma_key_matte(
 
     # ── Try Rust Native Accelerator or GPU path ──
     try:
+        if screen_samples:
+            raise RuntimeError("screen_samples requires Python/Torch ref_excess path")
         import ck2_native
         u8_in = frame_rgb if frame_rgb.dtype == np.uint8 else (np.clip(frame_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
-        sc_tuple = (float(screen_color[0]), float(screen_color[1]), float(screen_color[2])) if screen_color else (0.0, 177.0, 64.0)
+        default_tuple = (0.0, 71.0, 187.0) if screen_type == "blue" else (0.0, 177.0, 64.0)
+        sc_tuple = (float(screen_color[0]), float(screen_color[1]), float(screen_color[2])) if screen_color else default_tuple
         matte_f32 = ck2_native.chroma_key_matte_rust(
             u8_in,
             screen_type,
