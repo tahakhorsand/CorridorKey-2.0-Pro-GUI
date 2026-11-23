@@ -14,12 +14,18 @@
 **CorridorKey 2.0 Pro GUI** brings the cutting-edge raw-resolution video matting capabilities of **CorridorKey 2.0** into a standalone, studio-grade desktop application.
 
 Features include:
-- **CorridorKey 2.0 Native Engine**: Full-resolution raw-video green & blue screen inference with temporally coherent alpha mattes.
-- **SAM 3.1 Video Tracker**: Interactive multi-point (`1`/`2`) and bounding box (`R`) segmenter with high-speed video tracking.
-- **BiRefNet Studio Matting**: Zero-annotation automatic alpha generation supporting multiple models (General, Matting, HR, Dynamic, Lite).
-- **GPU Accelerated & VRAM Optimized**: Dynamic layer offloading to prevent out-of-memory errors on consumer GPUs (RTX 3060 to RTX 4090+).
-- **Chroma Key & Despill**: Real-time color-difference keyer with morphological cleanup and spill suppression.
-- **Dual Viewer Workspace**: Real-time side-by-side or split wipe comparison between Source, Alpha Matte, Cutout, and Checkerboard composite.
+- **CorridorKey 2.0 Native Engine**: Full-resolution raw-video green & blue screen inference with temporally coherent alpha mattes and Hair Matting v2 refinement.
+- **SAM 3.1 Video Tracker & Compact Weight Extractor**: Interactive multi-point (`1`/`2`) and bounding box (`R`) segmenter with multi-object tracking, One Frame Hint support, and HTTP-Range extraction (`scripts/extract_sam3_tracker_head.py`) for compact tracker weights.
+- **BiRefNet Studio Matting (9 Variants)**: Zero-annotation automatic alpha generation (One Frame Hint & Full Sequence) supporting all 9 ZhengPeng7 BiRefNet variants (`Matting`, `General`, `HR Matting`, `HR General`, `Dynamic Matting`, `Dynamic`, `Lite Matting`, `General Lite 2K`, `General Lite`) in the Download Manager, with automatic filtering to show only locally installed models.
+- **Toggleable Pro Engines (Opt-In)**:
+  - **Color Management & Display LUT**: Log-to-Linear profile transforms and real-time `.cube` 3D LUT previewing.
+  - **Temporal Deflicker**: Frame-to-frame alpha stability smoothing across sequences.
+  - **Advanced Despill**: Multi-band spill suppression with edge-aware color preservation.
+  - **Clean Plate Extraction**: Automated clean-plate generation and difference-matte integration.
+- **Polygon Mattes & Direct Mask Painting**: Bezier/linear polygon garbage & holdout mattes with keyframe interpolation, direct mask brush/eraser painting with Undo/Redo, and In/Out range mask interpolation.
+- **Dual Viewer, Smooth Playback & Inspection**: Multi-threaded read-ahead frame prefetching for responsive EXR/sequence playback, real-time A/B Wipe & Snapshot freeze compare, custom/video backdrops, ping-pong & variable-speed playback, live RGB/Alpha pixel inspector, and studio timeline with In/Out range markers.
+- **NLE Export & Headless Batch CLI**: Export to ProRes 4444 / 422 HQ, H.264, PNG, or EXR sequences with audio/timecode passthrough, Nuke (`.nk`) & Final Cut Pro (`.fcpxml`) project export, plus `backend/cli_batch.py` for headless batch keying.
+- **GPU Accelerated & VRAM Optimized**: Dynamic layer offloading and non-blocking NVML GPU monitoring to prevent out-of-memory errors on consumer GPUs (RTX 3060 to RTX 4090+).
 
 ---
 
@@ -38,7 +44,7 @@ Double-click:
 ```text
 install.bat
 ```
-This automatically fetches an isolated portable CPython 3.12 environment, creates `backend/venv`, and installs PyTorch with CUDA acceleration along with all Python dependencies. **No heavy model files are downloaded during this step.**
+This automatically fetches an isolated portable CPython 3.12 environment, creates `backend/venv`, installs PyTorch with CUDA acceleration along with all Python dependencies, and automatically installs portable FFmpeg into `tools/ffmpeg`. **No heavy AI model weights are downloaded during this step.**
 
 ### 3. Launch the Application
 Double-click:
